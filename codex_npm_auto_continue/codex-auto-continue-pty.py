@@ -294,6 +294,18 @@ def schedule_send(prompt: str) -> list[tuple[float, bytes]]:
     return queued
 
 
+def parse_positive_int(value: str) -> int:
+    try:
+        parsed = int(value)
+    except ValueError as error:
+        raise argparse.ArgumentTypeError("must be a positive integer") from error
+
+    if parsed <= 0:
+        raise argparse.ArgumentTypeError("must be a positive integer")
+
+    return parsed
+
+
 def build_child_argv(
     node_bin: str,
     launcher_path: str,
@@ -309,6 +321,7 @@ def build_child_argv(
         build_notify_override(current_python_argv(), notifier_path, host, port),
         *passthrough,
     ]
+
 
 def launch_child_unix(args: argparse.Namespace, passthrough: list[str]) -> int:
     notifier_path = Path(__file__).with_name("codex-auto-continue-notify.py")
@@ -329,7 +342,13 @@ def launch_child_unix(args: argparse.Namespace, passthrough: list[str]) -> int:
         os.execvpe(args.node, child_argv, child_env)
 
     try:
-        return forward_loop_unix(child_pid, master_fd, notify_socket, args.prompt)
+        return forward_loop_unix(
+            child_pid,
+            master_fd,
+            notify_socket,
+            args.prompt,
+            args.limit,
+        )
     finally:
         try:
             os.close(master_fd)
@@ -347,7 +366,11 @@ def copy_winsize_unix(source_fd: int, target_fd: int) -> None:
 
 
 def forward_loop_unix(
-    child_pid: int, master_fd: int, notify_socket: socket.socket, prompt: str
+    child_pid: int,
+    master_fd: int,
+    notify_socket: socket.socket,
+    prompt: str,
+    limit: Optional[int],
 ) -> int:
     stdin_fd = sys.stdin.fileno()
     stdout_fd = sys.stdout.fileno()
@@ -355,6 +378,7 @@ def forward_loop_unix(
     stdin_is_tty = os.isatty(stdin_fd)
     old_tty_settings = None
     auto_continue_enabled = True
+    remaining_sends = limit
     pending_send_bytes: list[tuple[float, bytes]] = []
     disable_allowed_at = time.monotonic() + DISABLE_GUARD_SECONDS
 
@@ -378,6 +402,7 @@ def forward_loop_unix(
     signal.signal(signal.SIGWINCH, on_sigwinch)
 
     disable_notice_shown = False
+    limit_notice_shown = False
 
     try:
         while True:
@@ -386,6 +411,18 @@ def forward_loop_unix(
                 os.write(master_fd, chunk)
                 if chunk == QUEUE_KEY:
                     debug("sent queue key")
+                    if remaining_sends is not None:
+                        remaining_sends -= 1
+                        debug(f"remaining auto-continue sends: {remaining_sends}")
+                        if remaining_sends == 0:
+                            auto_continue_enabled = False
+                            if not limit_notice_shown:
+                                os.write(
+                                    stderr_fd,
+                                    b"\r\n[codex-auto-continue] limit reached; disabled for this session.\r\n",
+                                )
+                                limit_notice_shown = True
+                            debug("auto-continue limit reached")
                 else:
                     debug(f"sent text chunk {chunk!r}")
 
@@ -519,6 +556,7 @@ def launch_child_windows(args: argparse.Namespace, passthrough: list[str]) -> in
             pty_output_read,
             notify_socket,
             args.prompt,
+            args.limit,
             stdin_handle,
             stdout_handle,
         )
@@ -827,6 +865,7 @@ def start_notify_listener(
     thread.start()
     return thread
 
+
 def poll_process_exit(process_handle: wintypes.HANDLE) -> Optional[int]:
     wait_result = kernel32.WaitForSingleObject(process_handle, 0)
     if wait_result == WAIT_TIMEOUT:
@@ -856,13 +895,16 @@ def forward_loop_windows(
     output_read: wintypes.HANDLE,
     notify_socket: socket.socket,
     prompt: str,
+    limit: Optional[int],
     stdin_handle: wintypes.HANDLE,
     stdout_handle: wintypes.HANDLE,
 ) -> int:
     auto_continue_enabled = True
+    remaining_sends = limit
     pending_send_bytes: list[tuple[float, bytes]] = []
     disable_allowed_at = time.monotonic() + DISABLE_GUARD_SECONDS
     disable_notice_shown = False
+    limit_notice_shown = False
     stop_event = threading.Event()
     stdin_queue: queue.Queue = queue.Queue()
     notify_queue: queue.Queue = queue.Queue()
@@ -885,6 +927,18 @@ def forward_loop_windows(
                     break
                 if chunk == QUEUE_KEY:
                     debug("sent queue key")
+                    if remaining_sends is not None:
+                        remaining_sends -= 1
+                        debug(f"remaining auto-continue sends: {remaining_sends}")
+                        if remaining_sends == 0:
+                            auto_continue_enabled = False
+                            if not limit_notice_shown:
+                                os.write(
+                                    sys.stderr.fileno(),
+                                    b"\r\n[codex-auto-continue] limit reached; disabled for this session.\r\n",
+                                )
+                                limit_notice_shown = True
+                            debug("auto-continue limit reached")
                 else:
                     debug(f"sent text chunk {chunk!r}")
                 continue
@@ -962,6 +1016,7 @@ def parse_args() -> tuple[argparse.Namespace, list[str]]:
     parser.add_argument("--node", required=True)
     parser.add_argument("--launcher", required=True)
     parser.add_argument("--prompt", required=True)
+    parser.add_argument("--limit", type=parse_positive_int)
     parser.add_argument("passthrough", nargs=argparse.REMAINDER)
     args = parser.parse_args()
 

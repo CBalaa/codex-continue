@@ -16,6 +16,7 @@ const PTY_HELPER = path.join(__dirname, "codex-auto-continue-pty.py");
 const WRAPPER_AUTO_FLAG = "--auto-continue";
 const WRAPPER_NO_AUTO_FLAG = "--no-auto-continue";
 const WRAPPER_PROMPT_FLAG = "--auto-continue-prompt";
+const WRAPPER_LIMIT_FLAG = "--auto-continue-limit";
 const DEBUG_LOG_PATH =
   process.env.CODEX_AUTO_CONTINUE_DEBUG_LOG ||
   path.join(os.tmpdir(), "codex-auto-continue-debug.log");
@@ -46,6 +47,7 @@ function parseWrapperArgs(argv) {
   const passthrough = [];
   let autoContinue = null;
   let autoPrompt = "继续";
+  let autoLimit = null;
 
   for (let index = 0; index < argv.length; index += 1) {
     const arg = argv[index];
@@ -70,6 +72,21 @@ function parseWrapperArgs(argv) {
       continue;
     }
 
+    if (arg === WRAPPER_LIMIT_FLAG) {
+      const value = argv[index + 1];
+      if (value === undefined) {
+        throw new Error(`${WRAPPER_LIMIT_FLAG} requires a value`);
+      }
+
+      if (!/^[1-9]\d*$/.test(value)) {
+        throw new Error(`${WRAPPER_LIMIT_FLAG} must be a positive integer`);
+      }
+
+      autoLimit = Number.parseInt(value, 10);
+      index += 1;
+      continue;
+    }
+
     passthrough.push(arg);
   }
 
@@ -79,6 +96,7 @@ function parseWrapperArgs(argv) {
 
   return {
     autoContinue,
+    autoLimit,
     autoPrompt,
     passthrough,
   };
@@ -235,7 +253,10 @@ async function main() {
   }
 
   console.error(
-    `[codex-auto-continue] enabled with prompt ${JSON.stringify(parsed.autoPrompt)}; ` +
+    `[codex-auto-continue] enabled with prompt ${JSON.stringify(parsed.autoPrompt)} ` +
+      `and limit ${
+        parsed.autoLimit === null ? "unlimited sends" : `${parsed.autoLimit} sends`
+      }; ` +
       "press bare Esc or Ctrl+C to disable it for this session.",
   );
   if (process.env.CODEX_AUTO_CONTINUE_DEBUG === "1") {
@@ -252,6 +273,9 @@ async function main() {
     REAL_LAUNCHER,
     "--prompt",
     parsed.autoPrompt,
+    ...(parsed.autoLimit === null
+      ? []
+      : ["--limit", String(parsed.autoLimit)]),
     "--",
     ...parsed.passthrough,
   ]);

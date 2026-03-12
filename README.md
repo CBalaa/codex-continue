@@ -99,6 +99,12 @@ codex --auto-continue
 codex --auto-continue --auto-continue-prompt "继续"
 ```
 
+限制自动发送“继续”的次数（正整数；不指定时默认无限次）：
+
+```bash
+codex --auto-continue --auto-continue-limit 3
+```
+
 ## 调试
 
 打开调试输出：
