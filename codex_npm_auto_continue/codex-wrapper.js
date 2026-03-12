@@ -2,6 +2,7 @@
 
 import { spawn, spawnSync } from "node:child_process";
 import { existsSync } from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import process from "node:process";
 import readline from "node:readline";
@@ -16,7 +17,8 @@ const WRAPPER_AUTO_FLAG = "--auto-continue";
 const WRAPPER_NO_AUTO_FLAG = "--no-auto-continue";
 const WRAPPER_PROMPT_FLAG = "--auto-continue-prompt";
 const DEBUG_LOG_PATH =
-  process.env.CODEX_AUTO_CONTINUE_DEBUG_LOG || "/tmp/codex-auto-continue-debug.log";
+  process.env.CODEX_AUTO_CONTINUE_DEBUG_LOG ||
+  path.join(os.tmpdir(), "codex-auto-continue-debug.log");
 const NON_INTERACTIVE_SUBCOMMANDS = new Set([
   "exec",
   "review",
@@ -108,12 +110,18 @@ function shouldOfferAutoContinue(argv) {
 function findPython() {
   const candidates = [];
   if (process.env.PYTHON) {
-    candidates.push(process.env.PYTHON);
+    candidates.push([process.env.PYTHON]);
   }
-  candidates.push("python3", "python");
+
+  if (process.platform === "win32") {
+    candidates.push(["python"], ["py", "-3"], ["py"]);
+  } else {
+    candidates.push(["python3"], ["python"]);
+  }
 
   for (const candidate of candidates) {
-    const result = spawnSync(candidate, ["--version"], {
+    const [command, ...prefixArgs] = candidate;
+    const result = spawnSync(command, [...prefixArgs, "--version"], {
       stdio: "ignore",
     });
     if (!result.error && result.status === 0) {
@@ -218,7 +226,11 @@ async function main() {
 
   const python = findPython();
   if (!python) {
-    console.error("Auto-continue mode requires python3 or python on PATH.");
+    const dependencyHint =
+      process.platform === "win32"
+        ? "python, py -3, or PYTHON"
+        : "python3, python, or PYTHON";
+    console.error(`Auto-continue mode requires ${dependencyHint} on PATH.`);
     process.exit(1);
   }
 
@@ -230,7 +242,9 @@ async function main() {
     console.error(`[codex-auto-continue] debug log: ${DEBUG_LOG_PATH}`);
   }
 
-  await spawnAndMirror(python, [
+  const [pythonCommand, ...pythonArgs] = python;
+  await spawnAndMirror(pythonCommand, [
+    ...pythonArgs,
     PTY_HELPER,
     "--node",
     process.execPath,
