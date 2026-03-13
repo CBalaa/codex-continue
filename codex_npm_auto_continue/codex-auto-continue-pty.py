@@ -13,6 +13,7 @@ import sys
 import tempfile
 import threading
 import time
+from collections import deque
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
@@ -22,6 +23,10 @@ from urllib import request as urllib_request
 
 AUTO_SEND_DELAY_SECONDS = 0.2
 CHAR_SEND_INTERVAL_SECONDS = 0.03
+CONTROL_POLL_INTERVAL_SECONDS = 0.1
+CONTROL_RECONNECT_DELAY_SECONDS = 1.0
+CONTROL_STREAM_TIMEOUT_SECONDS = 90.0
+ESC_HOTKEY_DISAMBIGUATION_SECONDS = 0.1
 QUEUE_KEY = b"\t"
 DISABLE_GUARD_SECONDS = 1.0
 CTRL_C = 3
@@ -29,7 +34,16 @@ ESC = 27
 LOCALHOST = "127.0.0.1"
 DEFAULT_NTFY_BASE_URL = "https://ntfy.sh"
 DEFAULT_NOTIFY_TIMEOUT_MS = 3000
-NTFY_NOTIFICATION_TITLE = "Codex turn complete"
+MANUAL_MODE = "manual"
+AUTO_MODE = "auto"
+CHAT_MODE = "chat"
+AUTO_SOURCE = "auto"
+CHAT_SOURCE = "chat"
+USER_SENDER = "user"
+CODEX_SENDER = "codex"
+NTFY_TURN_NOTIFICATION_TITLE = "Codex turn complete"
+NTFY_CONTROL_NOTIFICATION_TITLE = "Codex remote control"
+NTFY_CONTROL_ERROR_TITLE = "Codex remote control error"
 
 if os.name == "nt":
     import ctypes
@@ -231,6 +245,39 @@ class NtfyConfig:
     timeout_seconds: float
 
 
+@dataclass
+class AutoTask:
+    message: str
+    remaining: Optional[int]
+
+
+@dataclass(frozen=True)
+class ScheduledSend:
+    message: str
+    source: str
+
+
+@dataclass(frozen=True)
+class RemoteCommand:
+    kind: str
+    auto_tasks: tuple[AutoTask, ...] = ()
+    chat_messages: tuple[str, ...] = ()
+
+
+@dataclass
+class SessionState:
+    mode: str
+    auto_tasks: deque[AutoTask]
+    chat_queue: deque[str]
+    turn_in_flight: bool = False
+
+
+@dataclass
+class StdinHotkeyState:
+    pending_escape: bytes = b""
+    pending_escape_deadline: Optional[float] = None
+
+
 def build_notify_override(
     python_argv: list[str], notifier_path: Path, host: str, port: int
 ) -> str:
@@ -301,8 +348,81 @@ def last_assistant_message(event: dict[str, object]) -> str:
     return message
 
 
-def format_ntfy_message(event: dict[str, object]) -> str:
+def append_text_block(lines: list[str], label: str, text: str) -> None:
+    lines.append(f"{label}:")
+    lines.extend(text.split("\n"))
+
+
+def format_remaining_count(value: Optional[int]) -> str:
+    if value is None:
+        return "unlimited"
+    return str(value)
+
+
+def total_auto_remaining(auto_tasks: deque[AutoTask]) -> Optional[int]:
+    total = 0
+    for task in auto_tasks:
+        if task.remaining is None:
+            return None
+        total += task.remaining
+    return total
+
+
+def current_auto_task(state: SessionState) -> Optional[AutoTask]:
+    if not state.auto_tasks:
+        return None
+    return state.auto_tasks[0]
+
+
+def build_initial_session_state(
+    mode: str, prompt: str, limit: Optional[int]
+) -> SessionState:
+    if mode == CHAT_MODE:
+        return SessionState(
+            mode=CHAT_MODE,
+            auto_tasks=deque(),
+            chat_queue=deque(),
+        )
+    return SessionState(
+        mode=AUTO_MODE,
+        auto_tasks=deque([AutoTask(message=prompt, remaining=limit)]),
+        chat_queue=deque(),
+    )
+
+
+def build_state_payload(state: SessionState) -> dict[str, object]:
+    payload: dict[str, object] = {"mode": state.mode}
+    if state.mode == AUTO_MODE:
+        payload["remaining_total"] = total_auto_remaining(state.auto_tasks)
+        task = current_auto_task(state)
+        if task is not None:
+            payload["current_task_remaining"] = task.remaining
+            payload["current_task_message"] = task.message
+    elif state.mode == CHAT_MODE:
+        payload["queued_chat_messages"] = len(state.chat_queue)
+    return payload
+
+
+def summarize_state_lines(state: SessionState) -> list[str]:
+    lines = [f"mode: {state.mode}"]
+    if state.mode == AUTO_MODE:
+        lines.append(
+            f"remaining-total: {format_remaining_count(total_auto_remaining(state.auto_tasks))}"
+        )
+        task = current_auto_task(state)
+        if task is not None:
+            lines.append(
+                f"current-task-remaining: {format_remaining_count(task.remaining)}"
+            )
+            append_text_block(lines, "current-task-message", task.message)
+    elif state.mode == CHAT_MODE:
+        lines.append(f"queued-chat-messages: {len(state.chat_queue)}")
+    return lines
+
+
+def format_turn_notification(event: dict[str, object], state: SessionState) -> str:
     lines: list[str] = []
+    lines.extend(summarize_state_lines(state))
 
     cwd = coerce_notification_text(event.get("cwd"))
     if cwd is not None:
@@ -317,22 +437,93 @@ def format_ntfy_message(event: dict[str, object]) -> str:
 
     if lines:
         lines.append("")
-    lines.append("assistant:")
-    lines.append(last_assistant_message(event))
+    append_text_block(lines, "assistant", last_assistant_message(event))
     return "\n".join(lines)
 
 
-def build_ntfy_publish_url(base_url: str, topic: str) -> str:
+def build_turn_notification_payload(
+    event: dict[str, object], state: SessionState
+) -> dict[str, object]:
+    payload: dict[str, object] = {
+        "sender": CODEX_SENDER,
+        "type": "turn-complete",
+        "text": format_turn_notification(event, state),
+        **build_state_payload(state),
+    }
+
+    cwd = coerce_notification_text(event.get("cwd"))
+    if cwd is not None:
+        payload["cwd"] = cwd
+
+    user_message = last_input_message(event)
+    if user_message is not None:
+        payload["user"] = user_message
+
+    payload["assistant"] = last_assistant_message(event)
+
+    thread_id = coerce_notification_text(event.get("thread-id"))
+    if thread_id is not None:
+        payload["thread_id"] = thread_id
+
+    turn_id = coerce_notification_text(event.get("turn-id"))
+    if turn_id is not None:
+        payload["turn_id"] = turn_id
+
+    return payload
+
+
+def format_control_response(
+    state: SessionState,
+    command_summary: str,
+    status: str,
+    detail: Optional[str] = None,
+) -> str:
+    lines = [f"command: {command_summary}", f"status: {status}"]
+    if detail is not None:
+        lines.append(f"detail: {detail}")
+    lines.extend(summarize_state_lines(state))
+    return "\n".join(lines)
+
+
+def build_control_response_payload(
+    state: SessionState, body: str, error: bool = False
+) -> dict[str, object]:
+    return {
+        "sender": CODEX_SENDER,
+        "type": "control-error" if error else "control-response",
+        "text": body,
+        **build_state_payload(state),
+    }
+
+
+def build_ntfy_topic_url(base_url: str, topic: str) -> str:
     return f"{base_url}/{urllib_parse.quote(topic, safe='')}"
 
 
-def send_ntfy_notification(config: NtfyConfig, event: dict[str, object]) -> None:
+def build_ntfy_stream_url(base_url: str, topic: str, since: str) -> str:
+    query = urllib_parse.urlencode({"since": since})
+    return f"{build_ntfy_topic_url(base_url, topic)}/json?{query}"
+
+
+def serialize_ntfy_body(body: object) -> tuple[bytes, str]:
+    if isinstance(body, dict):
+        return (
+            json.dumps(body, ensure_ascii=False, separators=(",", ":")).encode("utf-8"),
+            "application/json; charset=utf-8",
+        )
+    if isinstance(body, str):
+        return body.encode("utf-8"), "text/plain; charset=utf-8"
+    raise TypeError("unsupported ntfy body type")
+
+
+def send_ntfy_message(config: NtfyConfig, title: str, body: object) -> None:
+    payload_bytes, content_type = serialize_ntfy_body(body)
     request = urllib_request.Request(
-        build_ntfy_publish_url(config.base_url, config.topic),
-        data=format_ntfy_message(event).encode("utf-8"),
+        build_ntfy_topic_url(config.base_url, config.topic),
+        data=payload_bytes,
         headers={
-            "Content-Type": "text/plain; charset=utf-8",
-            "Title": NTFY_NOTIFICATION_TITLE,
+            "Content-Type": content_type,
+            "Title": title,
         },
         method="POST",
     )
@@ -340,39 +531,398 @@ def send_ntfy_notification(config: NtfyConfig, event: dict[str, object]) -> None
         response.read()
 
 
-def maybe_send_turn_notification(
-    config: Optional[NtfyConfig], event: dict[str, object]
+def maybe_send_ntfy_message(
+    config: Optional[NtfyConfig], title: str, body: object, context: str
 ) -> None:
     if config is None:
         return
 
     try:
-        send_ntfy_notification(config, event)
+        send_ntfy_message(config, title, body)
         debug(
-            "sent ntfy notification before auto-continue "
+            f"sent ntfy {context} notification "
             f"for topic {config.topic!r}"
         )
     except (OSError, ValueError, urllib_error.URLError) as error:
-        debug(f"ntfy notification failed: {error}")
+        debug(f"ntfy {context} notification failed: {error}")
 
 
-def bare_escape_pressed(data: bytes) -> bool:
-    if data == b"\x1b":
+def maybe_send_turn_notification(
+    config: Optional[NtfyConfig], event: dict[str, object], state: SessionState
+) -> None:
+    maybe_send_ntfy_message(
+        config,
+        NTFY_TURN_NOTIFICATION_TITLE,
+        build_turn_notification_payload(event, state),
+        "turn",
+    )
+
+
+def maybe_send_control_response(
+    config: Optional[NtfyConfig],
+    state: SessionState,
+    body: str,
+    error: bool = False,
+) -> None:
+    maybe_send_ntfy_message(
+        config,
+        NTFY_CONTROL_ERROR_TITLE if error else NTFY_CONTROL_NOTIFICATION_TITLE,
+        build_control_response_payload(state, body, error),
+        "control",
+    )
+
+
+def is_positive_int(value: object) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool) and value > 0
+
+
+def parse_auto_tasks(payload: object) -> tuple[AutoTask, ...]:
+    if not isinstance(payload, list) or not payload:
+        raise ValueError('"tasks" must be a non-empty array')
+
+    parsed_tasks: list[AutoTask] = []
+    for item in payload:
+        if not isinstance(item, dict):
+            raise ValueError('"tasks" entries must be objects')
+
+        message = coerce_notification_text(item.get("message"))
+        if message is None:
+            raise ValueError('"tasks[].message" must be a non-empty string')
+
+        count = item.get("count")
+        if not is_positive_int(count):
+            raise ValueError('"tasks[].count" must be a positive integer')
+
+        parsed_tasks.append(AutoTask(message=message, remaining=int(count)))
+    return tuple(parsed_tasks)
+
+
+def parse_chat_messages(payload: object) -> tuple[str, ...]:
+    if not isinstance(payload, list) or not payload:
+        raise ValueError('"messages" must be a non-empty array')
+
+    parsed_messages: list[str] = []
+    for item in payload:
+        message = coerce_notification_text(item)
+        if message is None:
+            raise ValueError('"messages" entries must be non-empty strings')
+        parsed_messages.append(message)
+    return tuple(parsed_messages)
+
+
+def parse_remote_command_payload(payload: dict[str, object]) -> RemoteCommand:
+    command = payload.get("command")
+    mode = payload.get("mode")
+    if command is not None and mode is not None:
+        raise ValueError('control message must use either "command" or "mode"')
+
+    if command is not None:
+        if command != "stop_auto":
+            raise ValueError('unsupported command; expected "stop_auto"')
+        return RemoteCommand(kind="stop_auto")
+
+    if mode == AUTO_MODE:
+        return RemoteCommand(kind=AUTO_MODE, auto_tasks=parse_auto_tasks(payload.get("tasks")))
+    if mode == CHAT_MODE:
+        return RemoteCommand(
+            kind=CHAT_MODE,
+            chat_messages=parse_chat_messages(payload.get("messages")),
+        )
+    raise ValueError('unsupported mode; expected "auto" or "chat"')
+
+
+def parse_remote_command_message(message: str) -> Optional[RemoteCommand]:
+    try:
+        payload = json.loads(message)
+    except json.JSONDecodeError as error:
+        raise ValueError("control message body must be valid JSON") from error
+
+    if not isinstance(payload, dict):
+        raise ValueError("control message body must be a JSON object")
+
+    sender = payload.get("sender")
+    if sender == CODEX_SENDER:
+        return None
+    if sender != USER_SENDER:
+        raise ValueError('control messages must include "sender":"user"')
+
+    return parse_remote_command_payload(payload)
+
+
+def maybe_next_scheduled_send(
+    state: SessionState, current_send: Optional[ScheduledSend]
+) -> Optional[ScheduledSend]:
+    if current_send is not None or state.turn_in_flight:
+        return None
+
+    if state.mode == AUTO_MODE:
+        task = current_auto_task(state)
+        if task is None:
+            return None
+        return ScheduledSend(message=task.message, source=AUTO_SOURCE)
+
+    if state.mode == CHAT_MODE and state.chat_queue:
+        return ScheduledSend(message=state.chat_queue[0], source=CHAT_SOURCE)
+
+    return None
+
+
+def commit_scheduled_send(state: SessionState, scheduled: ScheduledSend) -> None:
+    state.turn_in_flight = True
+    if scheduled.source == AUTO_SOURCE:
+        task = current_auto_task(state)
+        if task is None:
+            return
+        if task.remaining is not None:
+            task.remaining -= 1
+            if task.remaining <= 0:
+                state.auto_tasks.popleft()
+        return
+
+    if scheduled.source == CHAT_SOURCE and state.chat_queue:
+        state.chat_queue.popleft()
+
+
+def maybe_finalize_idle_mode(
+    state: SessionState, config: Optional[NtfyConfig]
+) -> None:
+    if state.turn_in_flight:
+        return
+
+    if state.mode == AUTO_MODE and not state.auto_tasks:
+        state.mode = MANUAL_MODE
+        maybe_send_control_response(
+            config,
+            state,
+            format_control_response(
+                state,
+                "auto-queue",
+                "completed",
+                "auto queue finished; switched to manual mode",
+            ),
+        )
+
+
+def apply_remote_command(state: SessionState, command: RemoteCommand) -> str:
+    if command.kind == AUTO_MODE:
+        state.mode = AUTO_MODE
+        state.auto_tasks = deque(
+            AutoTask(message=task.message, remaining=task.remaining)
+            for task in command.auto_tasks
+        )
+        state.chat_queue.clear()
+        return format_control_response(
+            state,
+            "auto",
+            "applied",
+            f"loaded {len(command.auto_tasks)} auto task(s)",
+        )
+
+    if command.kind == CHAT_MODE:
+        state.mode = CHAT_MODE
+        state.auto_tasks.clear()
+        state.chat_queue.extend(command.chat_messages)
+        return format_control_response(
+            state,
+            "chat",
+            "applied",
+            f"queued {len(command.chat_messages)} chat message(s)",
+        )
+
+    if state.mode != AUTO_MODE:
+        return format_control_response(
+            state,
+            "stop_auto",
+            "ignored",
+            "stop_auto only applies while mode=auto",
+        )
+
+    state.mode = MANUAL_MODE
+    state.auto_tasks.clear()
+    return format_control_response(
+        state,
+        "stop_auto",
+        "applied",
+        "switched to manual mode and cleared auto tasks",
+    )
+
+
+def build_control_message_summary(event: dict[str, object]) -> str:
+    message_id = coerce_notification_text(event.get("id"))
+    if message_id is None:
+        return "remote"
+    return f"remote:{message_id}"
+
+
+def should_cancel_pending_send(
+    command: RemoteCommand, current_send: Optional[ScheduledSend], turn_in_flight: bool
+) -> bool:
+    if turn_in_flight or current_send is None:
+        return False
+    if command.kind == AUTO_MODE:
         return True
+    if command.kind == CHAT_MODE:
+        return current_send.source == AUTO_SOURCE
+    return current_send.source == AUTO_SOURCE
 
-    for index, value in enumerate(data):
+
+def process_control_message(
+    state: SessionState,
+    config: Optional[NtfyConfig],
+    event: dict[str, object],
+    current_send: Optional[ScheduledSend],
+) -> bool:
+    raw_message = coerce_notification_text(event.get("message"))
+    if raw_message is None:
+        maybe_send_control_response(
+            config,
+            state,
+            format_control_response(
+                state,
+                build_control_message_summary(event),
+                "error",
+                "control message body must be a non-empty string",
+            ),
+            error=True,
+        )
+        return False
+
+    try:
+        command = parse_remote_command_message(raw_message)
+    except ValueError as error:
+        maybe_send_control_response(
+            config,
+            state,
+            format_control_response(
+                state,
+                build_control_message_summary(event),
+                "error",
+                str(error),
+            ),
+            error=True,
+        )
+        return False
+
+    if command is None:
+        return False
+
+    cancel_pending = should_cancel_pending_send(command, current_send, state.turn_in_flight)
+    maybe_send_control_response(config, state, apply_remote_command(state, command))
+    return cancel_pending
+
+
+def start_ntfy_control_listener(
+    config: Optional[NtfyConfig],
+    control_queue: queue.Queue,
+    stop_event: threading.Event,
+) -> Optional[threading.Thread]:
+    if config is None:
+        return None
+
+    def worker() -> None:
+        since = str(int(time.time()))
+        last_message_id: Optional[str] = None
+
+        while not stop_event.is_set():
+            request = urllib_request.Request(
+                build_ntfy_stream_url(config.base_url, config.topic, since),
+                method="GET",
+            )
+            try:
+                with urllib_request.urlopen(
+                    request,
+                    timeout=max(config.timeout_seconds, CONTROL_STREAM_TIMEOUT_SECONDS),
+                ) as response:
+                    for raw_line in response:
+                        if stop_event.is_set():
+                            return
+
+                        line = raw_line.decode("utf-8").strip()
+                        if not line:
+                            continue
+
+                        try:
+                            event = json.loads(line)
+                        except json.JSONDecodeError:
+                            debug(f"control stream payload parse failed: {line!r}")
+                            continue
+
+                        if not isinstance(event, dict):
+                            continue
+                        if event.get("event") != "message":
+                            continue
+
+                        message_id = event.get("id")
+                        if isinstance(message_id, str) and message_id:
+                            if message_id == last_message_id:
+                                continue
+                            last_message_id = message_id
+                            since = message_id
+
+                        control_queue.put(event)
+            except (
+                OSError,
+                UnicodeDecodeError,
+                ValueError,
+                urllib_error.URLError,
+            ) as error:
+                debug(f"control listener reconnecting after error: {error}")
+                stop_event.wait(CONTROL_RECONNECT_DELAY_SECONDS)
+
+    thread = threading.Thread(target=worker, name="codex-auto-continue-control", daemon=True)
+    thread.start()
+    return thread
+
+
+def flush_pending_stdin_hotkey(
+    state: StdinHotkeyState, now: float
+) -> tuple[bytes, bool]:
+    if (
+        state.pending_escape
+        and state.pending_escape_deadline is not None
+        and now >= state.pending_escape_deadline
+    ):
+        state.pending_escape = b""
+        state.pending_escape_deadline = None
+        debug("resolved buffered stdin Esc as bare Esc hotkey")
+        return b"\x1b", True
+
+    return b"", False
+
+
+def process_stdin_hotkeys(
+    state: StdinHotkeyState, data: bytes, now: float
+) -> tuple[bytes, bool]:
+    combined = state.pending_escape + data
+    if state.pending_escape:
+        debug(f"resuming buffered stdin Esc with bytes={data!r}")
+    state.pending_escape = b""
+    state.pending_escape_deadline = None
+
+    forwarded = bytearray()
+    index = 0
+
+    while index < len(combined):
+        value = combined[index]
+        if value == CTRL_C:
+            forwarded.extend(combined[index:])
+            return bytes(forwarded), True
+
         if value != ESC:
+            forwarded.append(value)
+            index += 1
             continue
-        next_byte = data[index + 1] if index + 1 < len(data) else None
-        if next_byte in (ord("["), ord("O")):
-            continue
-        return True
 
-    return False
+        if index + 1 >= len(combined):
+            state.pending_escape = b"\x1b"
+            state.pending_escape_deadline = now + ESC_HOTKEY_DISAMBIGUATION_SECONDS
+            debug("buffered trailing stdin Esc awaiting sequence continuation")
+            break
 
+        forwarded.append(value)
+        index += 1
 
-def should_disable_auto_continue(data: bytes) -> bool:
-    return CTRL_C in data or bare_escape_pressed(data)
+    return bytes(forwarded), False
 
 
 def debug_enabled() -> bool:
@@ -410,6 +960,24 @@ def schedule_send(prompt: str) -> list[tuple[float, bytes]]:
         send_at += CHAR_SEND_INTERVAL_SECONDS
     queued.append((send_at, QUEUE_KEY))
     return queued
+
+
+def schedule_submission(
+    state: SessionState, current_send: Optional[ScheduledSend]
+) -> tuple[Optional[ScheduledSend], list[tuple[float, bytes]]]:
+    scheduled = maybe_next_scheduled_send(state, current_send)
+    if scheduled is None:
+        return current_send, []
+    debug(f"scheduled {scheduled.source} submission {scheduled.message!r}")
+    return scheduled, schedule_send(scheduled.message)
+
+
+def disable_session_automation(
+    state: SessionState,
+) -> None:
+    state.mode = MANUAL_MODE
+    state.auto_tasks.clear()
+    state.chat_queue.clear()
 
 
 def parse_positive_int(value: str) -> int:
@@ -464,6 +1032,7 @@ def launch_child_unix(args: argparse.Namespace, passthrough: list[str]) -> int:
             child_pid,
             master_fd,
             notify_socket,
+            args.mode,
             args.prompt,
             args.limit,
             args.ntfy_config,
@@ -488,6 +1057,7 @@ def forward_loop_unix(
     child_pid: int,
     master_fd: int,
     notify_socket: socket.socket,
+    mode: str,
     prompt: str,
     limit: Optional[int],
     ntfy_config: Optional[NtfyConfig],
@@ -497,10 +1067,14 @@ def forward_loop_unix(
     stderr_fd = sys.stderr.fileno()
     stdin_is_tty = os.isatty(stdin_fd)
     old_tty_settings = None
-    auto_continue_enabled = True
-    remaining_sends = limit
+    session_state = build_initial_session_state(mode, prompt, limit)
     pending_send_bytes: list[tuple[float, bytes]] = []
+    pending_submission: Optional[ScheduledSend] = None
+    stdin_hotkey_state = StdinHotkeyState()
     disable_allowed_at = time.monotonic() + DISABLE_GUARD_SECONDS
+    stop_event = threading.Event()
+    control_queue: queue.Queue = queue.Queue()
+    control_thread = start_ntfy_control_listener(ntfy_config, control_queue, stop_event)
 
     if stdin_is_tty:
         old_tty_settings = termios.tcgetattr(stdin_fd)
@@ -522,33 +1096,85 @@ def forward_loop_unix(
     signal.signal(signal.SIGWINCH, on_sigwinch)
 
     disable_notice_shown = False
-    limit_notice_shown = False
 
     try:
         while True:
-            if pending_send_bytes and time.monotonic() >= pending_send_bytes[0][0]:
+            now = time.monotonic()
+            if stdin_is_tty:
+                hotkey_bytes, disable_candidate = flush_pending_stdin_hotkey(
+                    stdin_hotkey_state, now
+                )
+                if hotkey_bytes:
+                    debug(f"stdin hotkey flush bytes={hotkey_bytes!r}")
+                    if disable_candidate and now >= disable_allowed_at:
+                        disable_session_automation(session_state)
+                        pending_send_bytes.clear()
+                        pending_submission = None
+                        if not disable_notice_shown:
+                            os.write(
+                                stderr_fd,
+                                b"\r\n[codex-auto-continue] switched to manual mode.\r\n",
+                            )
+                            disable_notice_shown = True
+                        debug(f"disabled by buffered stdin hotkey {hotkey_bytes!r}")
+                    os.write(master_fd, hotkey_bytes)
+
+            for control_event in drain_queue_nowait(control_queue):
+                assert isinstance(control_event, dict)
+                debug(f"control event={control_event!r}")
+                if process_control_message(
+                    session_state,
+                    ntfy_config,
+                    control_event,
+                    pending_submission,
+                ):
+                    pending_send_bytes.clear()
+                    pending_submission = None
+                    debug("cleared pending scheduled send after control update")
+
+            maybe_finalize_idle_mode(session_state, ntfy_config)
+            pending_submission, new_send_bytes = schedule_submission(
+                session_state, pending_submission
+            )
+            if new_send_bytes:
+                pending_send_bytes = new_send_bytes
+
+            if pending_send_bytes and now >= pending_send_bytes[0][0]:
                 _, chunk = pending_send_bytes.pop(0)
                 os.write(master_fd, chunk)
                 if chunk == QUEUE_KEY:
                     debug("sent queue key")
-                    if remaining_sends is not None:
-                        remaining_sends -= 1
-                        debug(f"remaining auto-continue sends: {remaining_sends}")
-                        if remaining_sends == 0:
-                            auto_continue_enabled = False
-                            if not limit_notice_shown:
-                                os.write(
-                                    stderr_fd,
-                                    b"\r\n[codex-auto-continue] limit reached; disabled for this session.\r\n",
-                                )
-                                limit_notice_shown = True
-                            debug("auto-continue limit reached")
+                    if pending_submission is not None:
+                        debug(
+                            "committing scheduled submission "
+                            f"{pending_submission.source}:{pending_submission.message!r}"
+                        )
+                        commit_scheduled_send(session_state, pending_submission)
+                        pending_submission = None
                 else:
                     debug(f"sent text chunk {chunk!r}")
 
             timeout = None
             if pending_send_bytes:
-                timeout = max(0.0, pending_send_bytes[0][0] - time.monotonic())
+                timeout = max(0.0, pending_send_bytes[0][0] - now)
+            if (
+                stdin_is_tty
+                and stdin_hotkey_state.pending_escape_deadline is not None
+            ):
+                hotkey_timeout = max(
+                    0.0, stdin_hotkey_state.pending_escape_deadline - now
+                )
+                timeout = (
+                    hotkey_timeout
+                    if timeout is None
+                    else min(timeout, hotkey_timeout)
+                )
+            if control_thread is not None:
+                timeout = (
+                    CONTROL_POLL_INTERVAL_SECONDS
+                    if timeout is None
+                    else min(timeout, CONTROL_POLL_INTERVAL_SECONDS)
+                )
 
             read_fds = [master_fd, notify_socket.fileno()]
             if stdin_is_tty:
@@ -570,20 +1196,32 @@ def forward_loop_unix(
                 if not data:
                     continue
                 debug(f"stdin bytes={data!r}")
+                data, disable_candidate = process_stdin_hotkeys(
+                    stdin_hotkey_state,
+                    data,
+                    time.monotonic(),
+                )
+                if not data and not disable_candidate:
+                    continue
+                helper_send_in_progress = bool(pending_send_bytes)
                 if (
-                    auto_continue_enabled
+                    disable_candidate
                     and time.monotonic() >= disable_allowed_at
-                    and should_disable_auto_continue(data)
                 ):
-                    auto_continue_enabled = False
+                    disable_session_automation(session_state)
                     pending_send_bytes.clear()
+                    pending_submission = None
+                    helper_send_in_progress = False
                     if not disable_notice_shown:
                         os.write(
                             stderr_fd,
-                            b"\r\n[codex-auto-continue] disabled for this session.\r\n",
+                            b"\r\n[codex-auto-continue] switched to manual mode.\r\n",
                         )
                         disable_notice_shown = True
                     debug(f"disabled by user input {data!r}")
+                if helper_send_in_progress:
+                    debug(f"suppressed stdin during scheduled send: {data!r}")
+                    continue
                 os.write(master_fd, data)
 
             if notify_socket.fileno() in ready:
@@ -594,17 +1232,12 @@ def forward_loop_unix(
                     debug(f"notify payload parse failed: {payload!r}")
                     continue
                 debug(f"notify event={event!r}")
-                if (
-                    auto_continue_enabled
-                    and event.get("type") == "agent-turn-complete"
-                ):
-                    maybe_send_turn_notification(ntfy_config, event)
-                    pending_send_bytes = schedule_send(prompt)
-                    debug(
-                        "received agent-turn-complete; "
-                        f"queued auto-continue prompt {prompt!r}"
-                    )
+                if event.get("type") == "agent-turn-complete":
+                    session_state.turn_in_flight = False
+                    maybe_send_turn_notification(ntfy_config, event, session_state)
+                    maybe_finalize_idle_mode(session_state, ntfy_config)
     finally:
+        stop_event.set()
         signal.signal(signal.SIGWINCH, previous_sigwinch)
         if old_tty_settings is not None:
             termios.tcsetattr(stdin_fd, termios.TCSADRAIN, old_tty_settings)
@@ -677,6 +1310,7 @@ def launch_child_windows(args: argparse.Namespace, passthrough: list[str]) -> in
             pty_input_write,
             pty_output_read,
             notify_socket,
+            args.mode,
             args.prompt,
             args.limit,
             args.ntfy_config,
@@ -1017,25 +1651,28 @@ def forward_loop_windows(
     input_write: wintypes.HANDLE,
     output_read: wintypes.HANDLE,
     notify_socket: socket.socket,
+    mode: str,
     prompt: str,
     limit: Optional[int],
     ntfy_config: Optional[NtfyConfig],
     stdin_handle: wintypes.HANDLE,
     stdout_handle: wintypes.HANDLE,
 ) -> int:
-    auto_continue_enabled = True
-    remaining_sends = limit
+    session_state = build_initial_session_state(mode, prompt, limit)
     pending_send_bytes: list[tuple[float, bytes]] = []
+    pending_submission: Optional[ScheduledSend] = None
+    stdin_hotkey_state = StdinHotkeyState()
     disable_allowed_at = time.monotonic() + DISABLE_GUARD_SECONDS
     disable_notice_shown = False
-    limit_notice_shown = False
     stop_event = threading.Event()
     stdin_queue: queue.Queue = queue.Queue()
     notify_queue: queue.Queue = queue.Queue()
+    control_queue: queue.Queue = queue.Queue()
     stdin_thread = start_windows_stdin_reader(stdin_handle, stdin_queue, stop_event)
     output_thread = start_windows_output_reader(output_read, stop_event)
     notify_thread = start_notify_listener(notify_socket, notify_queue, stop_event)
-    _ = stdin_thread, notify_thread
+    control_thread = start_ntfy_control_listener(ntfy_config, control_queue, stop_event)
+    _ = stdin_thread, notify_thread, control_thread
     last_console_size = current_console_size(stdout_handle)
     last_resize_check = 0.0
     exit_code: Optional[int] = None
@@ -1043,6 +1680,47 @@ def forward_loop_windows(
     try:
         while True:
             now = time.monotonic()
+            hotkey_bytes, disable_candidate = flush_pending_stdin_hotkey(
+                stdin_hotkey_state, now
+            )
+            if hotkey_bytes:
+                debug(f"stdin hotkey flush bytes={hotkey_bytes!r}")
+                if disable_candidate and now >= disable_allowed_at:
+                    disable_session_automation(session_state)
+                    pending_send_bytes.clear()
+                    pending_submission = None
+                    if not disable_notice_shown:
+                        os.write(
+                            sys.stderr.fileno(),
+                            b"\r\n[codex-auto-continue] switched to manual mode.\r\n",
+                        )
+                        disable_notice_shown = True
+                    debug(f"disabled by buffered stdin hotkey {hotkey_bytes!r}")
+                try:
+                    write_handle_bytes(input_write, hotkey_bytes)
+                except OSError:
+                    break
+
+            for control_event in drain_queue_nowait(control_queue):
+                assert isinstance(control_event, dict)
+                debug(f"control event={control_event!r}")
+                if process_control_message(
+                    session_state,
+                    ntfy_config,
+                    control_event,
+                    pending_submission,
+                ):
+                    pending_send_bytes.clear()
+                    pending_submission = None
+                    debug("cleared pending scheduled send after control update")
+
+            maybe_finalize_idle_mode(session_state, ntfy_config)
+            pending_submission, new_send_bytes = schedule_submission(
+                session_state, pending_submission
+            )
+            if new_send_bytes:
+                pending_send_bytes = new_send_bytes
+
             if pending_send_bytes and now >= pending_send_bytes[0][0]:
                 _, chunk = pending_send_bytes.pop(0)
                 try:
@@ -1051,18 +1729,13 @@ def forward_loop_windows(
                     break
                 if chunk == QUEUE_KEY:
                     debug("sent queue key")
-                    if remaining_sends is not None:
-                        remaining_sends -= 1
-                        debug(f"remaining auto-continue sends: {remaining_sends}")
-                        if remaining_sends == 0:
-                            auto_continue_enabled = False
-                            if not limit_notice_shown:
-                                os.write(
-                                    sys.stderr.fileno(),
-                                    b"\r\n[codex-auto-continue] limit reached; disabled for this session.\r\n",
-                                )
-                                limit_notice_shown = True
-                            debug("auto-continue limit reached")
+                    if pending_submission is not None:
+                        debug(
+                            "committing scheduled submission "
+                            f"{pending_submission.source}:{pending_submission.message!r}"
+                        )
+                        commit_scheduled_send(session_state, pending_submission)
+                        pending_submission = None
                 else:
                     debug(f"sent text chunk {chunk!r}")
                 continue
@@ -1071,20 +1744,29 @@ def forward_loop_windows(
             for data in drain_queue_nowait(stdin_queue):
                 assert isinstance(data, bytes)
                 debug(f"stdin bytes={data!r}")
-                if (
-                    auto_continue_enabled
-                    and now >= disable_allowed_at
-                    and should_disable_auto_continue(data)
-                ):
-                    auto_continue_enabled = False
+                data, disable_candidate = process_stdin_hotkeys(
+                    stdin_hotkey_state,
+                    data,
+                    time.monotonic(),
+                )
+                if not data and not disable_candidate:
+                    continue
+                helper_send_in_progress = bool(pending_send_bytes)
+                if disable_candidate and now >= disable_allowed_at:
+                    disable_session_automation(session_state)
                     pending_send_bytes.clear()
+                    pending_submission = None
+                    helper_send_in_progress = False
                     if not disable_notice_shown:
                         os.write(
                             sys.stderr.fileno(),
-                            b"\r\n[codex-auto-continue] disabled for this session.\r\n",
+                            b"\r\n[codex-auto-continue] switched to manual mode.\r\n",
                         )
                         disable_notice_shown = True
                     debug(f"disabled by user input {data!r}")
+                if helper_send_in_progress:
+                    debug(f"suppressed stdin during scheduled send: {data!r}")
+                    continue
                 try:
                     write_handle_bytes(input_write, data)
                 except OSError:
@@ -1096,13 +1778,10 @@ def forward_loop_windows(
             for event in drain_queue_nowait(notify_queue):
                 assert isinstance(event, dict)
                 debug(f"notify event={event!r}")
-                if auto_continue_enabled and event.get("type") == "agent-turn-complete":
-                    maybe_send_turn_notification(ntfy_config, event)
-                    pending_send_bytes = schedule_send(prompt)
-                    debug(
-                        "received agent-turn-complete; "
-                        f"queued auto-continue prompt {prompt!r}"
-                    )
+                if event.get("type") == "agent-turn-complete":
+                    session_state.turn_in_flight = False
+                    maybe_send_turn_notification(ntfy_config, event, session_state)
+                    maybe_finalize_idle_mode(session_state, ntfy_config)
 
             if now - last_resize_check >= 0.2:
                 current_size = current_console_size(stdout_handle)
@@ -1123,6 +1802,15 @@ def forward_loop_windows(
                     sleep_for,
                     max(0.0, pending_send_bytes[0][0] - time.monotonic()),
                 )
+            if stdin_hotkey_state.pending_escape_deadline is not None:
+                sleep_for = min(
+                    sleep_for,
+                    max(
+                        0.0,
+                        stdin_hotkey_state.pending_escape_deadline
+                        - time.monotonic(),
+                    ),
+                )
             time.sleep(max(0.0, sleep_for))
     finally:
         stop_event.set()
@@ -1140,6 +1828,7 @@ def parse_args() -> tuple[argparse.Namespace, list[str]]:
     parser = argparse.ArgumentParser()
     parser.add_argument("--node", required=True)
     parser.add_argument("--launcher", required=True)
+    parser.add_argument("--mode", choices=[AUTO_MODE, CHAT_MODE], default=AUTO_MODE)
     parser.add_argument("--prompt", required=True)
     parser.add_argument("--limit", type=parse_positive_int)
     parser.add_argument("--ntfy-topic")
@@ -1159,6 +1848,8 @@ def main() -> int:
     try:
         args, passthrough = parse_args()
         args.ntfy_config = build_ntfy_config(args)
+        if args.mode == CHAT_MODE and args.ntfy_config is None:
+            raise ValueError("--mode chat requires --ntfy-topic")
     except ValueError as error:
         print(error, file=sys.stderr)
         return 1

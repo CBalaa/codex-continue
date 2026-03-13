@@ -1,11 +1,10 @@
 #!/usr/bin/env node
 
 import { spawn, spawnSync } from "node:child_process";
-import { existsSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import process from "node:process";
-import readline from "node:readline";
 import { fileURLToPath } from "node:url";
 
 const __filename = fileURLToPath(import.meta.url);
@@ -13,15 +12,36 @@ const __dirname = path.dirname(__filename);
 
 const REAL_LAUNCHER = path.join(__dirname, "codex.real.js");
 const PTY_HELPER = path.join(__dirname, "codex-auto-continue-pty.py");
-const WRAPPER_AUTO_FLAG = "--auto-continue";
-const WRAPPER_NO_AUTO_FLAG = "--no-auto-continue";
+const WRAPPER_AUTO_FLAG = "--auto-mode";
+const WRAPPER_CHAT_FLAG = "--chat-mode";
+const WRAPPER_NATIVE_FLAG = "--native";
+const REMOVED_WRAPPER_AUTO_FLAG = "--auto-continue";
+const REMOVED_WRAPPER_NO_AUTO_FLAG = "--no-auto-continue";
 const WRAPPER_PROMPT_FLAG = "--auto-continue-prompt";
 const WRAPPER_LIMIT_FLAG = "--auto-continue-limit";
 const WRAPPER_NTFY_TOPIC_FLAG = "--auto-continue-ntfy-topic";
+const REMOVED_WRAPPER_NTFY_CONTROL_TOPIC_FLAG = "--auto-continue-ntfy-control-topic";
 const WRAPPER_NTFY_BASE_URL_FLAG = "--auto-continue-ntfy-base-url";
 const WRAPPER_NOTIFY_TIMEOUT_MS_FLAG = "--auto-continue-notify-timeout-ms";
+const REMOVED_NTFY_TOPIC_ENV = "CODEX_AUTO_CONTINUE_NTFY_TOPIC";
+const REMOVED_NTFY_CONTROL_TOPIC_ENV = "CODEX_AUTO_CONTINUE_NTFY_CONTROL_TOPIC";
 const DEFAULT_NTFY_BASE_URL = "https://ntfy.sh";
 const DEFAULT_NOTIFY_TIMEOUT_MS = 3000;
+const COMMENT_TOPIC_KEYS = [
+  "codex-remote-ntfy-topic",
+  "codex-remote-topic",
+  "codex-auto-continue-ntfy-topic",
+];
+const COMMENT_BASE_URL_KEYS = [
+  "codex-remote-ntfy-base-url",
+  "codex-remote-base-url",
+  "codex-auto-continue-ntfy-base-url",
+];
+const COMMENT_TIMEOUT_KEYS = [
+  "codex-remote-notify-timeout-ms",
+  "codex-remote-timeout-ms",
+  "codex-auto-continue-notify-timeout-ms",
+];
 const DEBUG_LOG_PATH =
   process.env.CODEX_AUTO_CONTINUE_DEBUG_LOG ||
   path.join(os.tmpdir(), "codex-auto-continue-debug.log");
@@ -89,32 +109,195 @@ function parsePositiveIntegerEnv(varName) {
   return parsePositiveInteger(varName, value);
 }
 
+function parseQuotedString(value) {
+  const trimmed = value.trim();
+  if (trimmed.length === 0) {
+    return "";
+  }
+
+  if (trimmed.startsWith('"') && trimmed.endsWith('"')) {
+    try {
+      return JSON.parse(trimmed);
+    } catch {
+      return trimmed.slice(1, -1);
+    }
+  }
+
+  if (trimmed.startsWith("'") && trimmed.endsWith("'")) {
+    return trimmed.slice(1, -1);
+  }
+
+  return trimmed;
+}
+
+function expandHomePath(value) {
+  if (value === "~") {
+    return os.homedir();
+  }
+  if (value.startsWith("~/") || value.startsWith("~\\")) {
+    return path.join(os.homedir(), value.slice(2));
+  }
+  return value;
+}
+
+function parseConfigAssignment(raw) {
+  const equalsIndex = raw.indexOf("=");
+  if (equalsIndex < 0) {
+    return null;
+  }
+
+  return {
+    key: raw.slice(0, equalsIndex).trim(),
+    value: raw.slice(equalsIndex + 1),
+  };
+}
+
+function resolveCodexConfigPath(passthrough) {
+  let configFileOverride = null;
+
+  for (let index = 0; index < passthrough.length; index += 1) {
+    const arg = passthrough[index];
+    let assignment = null;
+
+    if (arg === "-c" || arg === "--config") {
+      assignment = passthrough[index + 1];
+      if (assignment === undefined) {
+        break;
+      }
+      index += 1;
+    } else if (arg.startsWith("--config=")) {
+      assignment = arg.slice("--config=".length);
+    }
+
+    if (assignment === null) {
+      continue;
+    }
+
+    const parsed = parseConfigAssignment(assignment);
+    if (parsed === null || parsed.key !== "config_file") {
+      continue;
+    }
+
+    const value = normalizeOptionalString(parseQuotedString(parsed.value));
+    if (value !== null) {
+      configFileOverride = value;
+    }
+  }
+
+  if (configFileOverride !== null) {
+    return path.resolve(expandHomePath(configFileOverride));
+  }
+
+  const codexHome = normalizeOptionalString(process.env.CODEX_HOME);
+  if (codexHome !== null) {
+    return path.resolve(expandHomePath(codexHome), "config.toml");
+  }
+
+  return path.join(os.homedir(), ".codex", "config.toml");
+}
+
+function escapeRegExp(value) {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+function findConfigSetting(fileText, keys) {
+  for (const key of keys) {
+    const match = new RegExp(
+      `^\\s*(?:#\\s*)?${escapeRegExp(key)}\\s*=\\s*(.+?)\\s*$`,
+      "m",
+    ).exec(fileText);
+    if (match) {
+      return {
+        key,
+        rawValue: match[1].trim(),
+      };
+    }
+  }
+
+  return null;
+}
+
+function parseCommentStringSetting(configPath, setting) {
+  const value = normalizeOptionalString(parseQuotedString(setting.rawValue));
+  if (value === null) {
+    throw new Error(
+      `Invalid ${setting.key} in ${configPath}; expected a non-empty string.`,
+    );
+  }
+  return value;
+}
+
+function parseCommentIntegerSetting(configPath, setting) {
+  try {
+    return parsePositiveInteger(setting.key, parseQuotedString(setting.rawValue));
+  } catch {
+    throw new Error(
+      `Invalid ${setting.key} in ${configPath}; expected a positive integer.`,
+    );
+  }
+}
+
 function resolveNtfySettings(parsed) {
-  const ntfyTopic =
-    parsed.autoContinueNtfyTopic ??
-    normalizeOptionalString(process.env.CODEX_AUTO_CONTINUE_NTFY_TOPIC);
-  if (ntfyTopic === null) {
+  if (normalizeOptionalString(process.env[REMOVED_NTFY_CONTROL_TOPIC_ENV]) !== null) {
+    throw new Error(
+      `${REMOVED_NTFY_CONTROL_TOPIC_ENV} has been removed; configure the topic in config.toml comments instead.`,
+    );
+  }
+  if (normalizeOptionalString(process.env[REMOVED_NTFY_TOPIC_ENV]) !== null) {
+    throw new Error(
+      `${REMOVED_NTFY_TOPIC_ENV} has been removed; configure the topic in config.toml comments instead.`,
+    );
+  }
+
+  const configPath = resolveCodexConfigPath(parsed.passthrough);
+  if (!existsSync(configPath)) {
     return {
+      configExists: false,
+      configPath,
       ntfyBaseUrl: null,
       ntfyTopic: null,
       notifyTimeoutMs: null,
     };
   }
 
+  const fileText = readFileSync(configPath, "utf8");
+  const topicSetting = findConfigSetting(fileText, COMMENT_TOPIC_KEYS);
+  const ntfyTopic =
+    topicSetting === null ? null : parseCommentStringSetting(configPath, topicSetting);
+  if (ntfyTopic === null) {
+    return {
+      configExists: true,
+      configPath,
+      ntfyBaseUrl: null,
+      ntfyTopic: null,
+      notifyTimeoutMs: null,
+    };
+  }
+
+  const baseUrlSetting = findConfigSetting(fileText, COMMENT_BASE_URL_KEYS);
+  const timeoutSetting = findConfigSetting(fileText, COMMENT_TIMEOUT_KEYS);
   const ntfyBaseUrl = validateNtfyBaseUrl(
     parsed.autoContinueNtfyBaseUrl === null
       ? "CODEX_AUTO_CONTINUE_NTFY_BASE_URL"
       : WRAPPER_NTFY_BASE_URL_FLAG,
     parsed.autoContinueNtfyBaseUrl ??
       normalizeOptionalString(process.env.CODEX_AUTO_CONTINUE_NTFY_BASE_URL) ??
+      (baseUrlSetting === null
+        ? null
+        : parseCommentStringSetting(configPath, baseUrlSetting)) ??
       DEFAULT_NTFY_BASE_URL,
   );
   const notifyTimeoutMs =
     parsed.autoContinueNotifyTimeoutMs ??
     parsePositiveIntegerEnv("CODEX_AUTO_CONTINUE_NOTIFY_TIMEOUT_MS") ??
+    (timeoutSetting === null
+      ? null
+      : parseCommentIntegerSetting(configPath, timeoutSetting)) ??
     DEFAULT_NOTIFY_TIMEOUT_MS;
 
   return {
+    configExists: true,
+    configPath,
     ntfyBaseUrl,
     ntfyTopic,
     notifyTimeoutMs,
@@ -123,24 +306,47 @@ function resolveNtfySettings(parsed) {
 
 function parseWrapperArgs(argv) {
   const passthrough = [];
-  let autoContinue = null;
+  let launchMode = null;
   let autoPrompt = "继续";
   let autoLimit = null;
-  let autoContinueNtfyTopic = null;
   let autoContinueNtfyBaseUrl = null;
   let autoContinueNotifyTimeoutMs = null;
+
+  function setLaunchMode(nextMode, flagName) {
+    if (launchMode !== null && launchMode !== nextMode) {
+      throw new Error(
+        `${flagName} cannot be combined with another launch mode flag.`,
+      );
+    }
+    launchMode = nextMode;
+  }
 
   for (let index = 0; index < argv.length; index += 1) {
     const arg = argv[index];
 
     if (arg === WRAPPER_AUTO_FLAG) {
-      autoContinue = true;
+      setLaunchMode("auto", WRAPPER_AUTO_FLAG);
       continue;
     }
 
-    if (arg === WRAPPER_NO_AUTO_FLAG) {
-      autoContinue = false;
+    if (arg === WRAPPER_CHAT_FLAG) {
+      setLaunchMode("chat", WRAPPER_CHAT_FLAG);
       continue;
+    }
+
+    if (arg === WRAPPER_NATIVE_FLAG) {
+      setLaunchMode("native", WRAPPER_NATIVE_FLAG);
+      continue;
+    }
+
+    if (arg === REMOVED_WRAPPER_AUTO_FLAG) {
+      throw new Error(`${REMOVED_WRAPPER_AUTO_FLAG} has been removed; use ${WRAPPER_AUTO_FLAG}.`);
+    }
+
+    if (arg === REMOVED_WRAPPER_NO_AUTO_FLAG) {
+      throw new Error(
+        `${REMOVED_WRAPPER_NO_AUTO_FLAG} has been removed; use ${WRAPPER_NATIVE_FLAG}.`,
+      );
     }
 
     if (arg === WRAPPER_PROMPT_FLAG) {
@@ -165,16 +371,15 @@ function parseWrapperArgs(argv) {
     }
 
     if (arg === WRAPPER_NTFY_TOPIC_FLAG) {
-      const value = argv[index + 1];
-      if (value === undefined) {
-        throw new Error(`${WRAPPER_NTFY_TOPIC_FLAG} requires a value`);
-      }
-      if (value.trim().length === 0) {
-        throw new Error(`${WRAPPER_NTFY_TOPIC_FLAG} must not be empty`);
-      }
-      autoContinueNtfyTopic = value;
-      index += 1;
-      continue;
+      throw new Error(
+        `${WRAPPER_NTFY_TOPIC_FLAG} has been removed; configure the topic in config.toml comments instead.`,
+      );
+    }
+
+    if (arg === REMOVED_WRAPPER_NTFY_CONTROL_TOPIC_FLAG) {
+      throw new Error(
+        `${REMOVED_WRAPPER_NTFY_CONTROL_TOPIC_FLAG} has been removed; configure the topic in config.toml comments instead.`,
+      );
     }
 
     if (arg === WRAPPER_NTFY_BASE_URL_FLAG) {
@@ -211,10 +416,9 @@ function parseWrapperArgs(argv) {
   }
 
   return {
-    autoContinue,
+    launchMode,
     autoLimit,
     autoContinueNtfyBaseUrl,
-    autoContinueNtfyTopic,
     autoContinueNotifyTimeoutMs,
     autoPrompt,
     passthrough,
@@ -269,30 +473,14 @@ function findPython() {
   return null;
 }
 
-async function promptForLaunchMode() {
-  const rl = readline.createInterface({
-    input: process.stdin,
-    output: process.stdout,
-  });
-
-  process.stdout.write(
-    [
-      "",
-      "Codex launch mode:",
-      "  1) Normal",
-      "  2) Auto-continue after each completed turn",
-      "Select [1/2] (default 1): ",
-    ].join("\n"),
-  );
-
-  const answer = await new Promise((resolve) => {
-    rl.once("line", resolve);
-  });
-
-  rl.close();
-
-  const trimmed = String(answer).trim();
-  return trimmed === "2";
+function formatModeName(mode) {
+  if (mode === "auto") {
+    return "auto mode";
+  }
+  if (mode === "chat") {
+    return "chat mode";
+  }
+  return "native mode";
 }
 
 async function spawnAndMirror(command, args, options = {}) {
@@ -326,11 +514,6 @@ async function main() {
     process.exit(1);
   }
 
-  if (!existsSync(PTY_HELPER)) {
-    console.error(`Missing auto-continue helper: ${PTY_HELPER}`);
-    process.exit(1);
-  }
-
   let parsed;
   try {
     parsed = parseWrapperArgs(process.argv.slice(2));
@@ -345,49 +528,89 @@ async function main() {
     return;
   }
 
-  const shouldOffer =
-    parsed.autoContinue === null &&
-    process.stdin.isTTY &&
-    process.stdout.isTTY &&
-    eligibleForAutoContinue;
-  let enableAuto = parsed.autoContinue === true;
+  const launchMode = parsed.launchMode ?? "chat";
 
-  if (shouldOffer) {
-    enableAuto = await promptForLaunchMode();
+  if (launchMode === "native") {
+    await spawnAndMirror(process.execPath, [REAL_LAUNCHER, ...parsed.passthrough]);
+    return;
   }
 
-  if (!enableAuto) {
+  if (!process.stdin.isTTY || !process.stdout.isTTY) {
+    console.error(
+      `[codex-auto-continue] ${formatModeName(launchMode)} requires an interactive TTY; starting native Codex.`,
+    );
+    await spawnAndMirror(process.execPath, [REAL_LAUNCHER, ...parsed.passthrough]);
+    return;
+  }
+
+  if (!existsSync(PTY_HELPER)) {
+    console.error(
+      `[codex-auto-continue] missing helper ${PTY_HELPER}; starting native Codex.`,
+    );
+    await spawnAndMirror(process.execPath, [REAL_LAUNCHER, ...parsed.passthrough]);
+    return;
+  }
+
+  let ntfySettings;
+  try {
+    ntfySettings = resolveNtfySettings(parsed);
+  } catch (error) {
+    console.error(
+      `[codex-auto-continue] ${error.message} Starting native Codex instead.`,
+    );
+    await spawnAndMirror(process.execPath, [REAL_LAUNCHER, ...parsed.passthrough]);
+    return;
+  }
+
+  if (ntfySettings.ntfyTopic === null) {
+    const detail =
+      ntfySettings.configExists === false
+        ? `${ntfySettings.configPath} was not found`
+        : `no remote topic is configured in ${ntfySettings.configPath}`;
+    console.error(
+      `[codex-auto-continue] ${formatModeName(launchMode)} requested, but ${detail}; starting native Codex. Add ` +
+        `"# codex-remote-topic = \\"your-topic\\"" to enable remote mode.`,
+    );
     await spawnAndMirror(process.execPath, [REAL_LAUNCHER, ...parsed.passthrough]);
     return;
   }
 
   const python = findPython();
   if (!python) {
-    const dependencyHint =
-      process.platform === "win32"
-        ? "python, py -3, or PYTHON"
-        : "python3, python, or PYTHON";
-    console.error(`Auto-continue mode requires ${dependencyHint} on PATH.`);
-    process.exit(1);
+    console.error(
+      `[codex-auto-continue] ${formatModeName(launchMode)} requires ${
+        process.platform === "win32"
+          ? "python, py -3, or PYTHON"
+          : "python3, python, or PYTHON"
+      } on PATH; starting native Codex.`,
+    );
+    await spawnAndMirror(process.execPath, [REAL_LAUNCHER, ...parsed.passthrough]);
+    return;
   }
 
-  console.error(
-    `[codex-auto-continue] enabled with prompt ${JSON.stringify(parsed.autoPrompt)} ` +
-      `and limit ${
-        parsed.autoLimit === null ? "unlimited sends" : `${parsed.autoLimit} sends`
-      }; ` +
-      "press bare Esc or Ctrl+C to disable it for this session.",
-  );
+  if (launchMode === "auto") {
+    console.error(
+      `[codex-auto-continue] enabled with prompt ${JSON.stringify(parsed.autoPrompt)} ` +
+        `and limit ${
+          parsed.autoLimit === null ? "unlimited sends" : `${parsed.autoLimit} sends`
+        }; ` +
+        "press bare Esc or Ctrl+C to switch to manual mode.",
+    );
+  } else {
+    console.error(
+      "[codex-auto-continue] chat mode enabled; waiting for remote ntfy messages; " +
+        "press bare Esc or Ctrl+C to switch to manual mode.",
+    );
+  }
   if (process.env.CODEX_AUTO_CONTINUE_DEBUG === "1") {
     console.error(`[codex-auto-continue] debug log: ${DEBUG_LOG_PATH}`);
   }
 
-  const ntfySettings = resolveNtfySettings(parsed);
   if (ntfySettings.ntfyTopic !== null) {
     console.error(
-      `[codex-auto-continue] ntfy notifications enabled for topic ${JSON.stringify(
+      `[codex-auto-continue] ntfy single-topic JSON mode on ${JSON.stringify(
         ntfySettings.ntfyTopic,
-      )} via ${ntfySettings.ntfyBaseUrl} ` +
+      )} from ${ntfySettings.configPath} via ${ntfySettings.ntfyBaseUrl} ` +
         `(timeout ${ntfySettings.notifyTimeoutMs}ms).`,
     );
   }
@@ -400,6 +623,8 @@ async function main() {
     process.execPath,
     "--launcher",
     REAL_LAUNCHER,
+    "--mode",
+    launchMode,
     "--prompt",
     parsed.autoPrompt,
     ...(parsed.autoLimit === null
