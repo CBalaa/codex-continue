@@ -17,6 +17,11 @@ const WRAPPER_AUTO_FLAG = "--auto-continue";
 const WRAPPER_NO_AUTO_FLAG = "--no-auto-continue";
 const WRAPPER_PROMPT_FLAG = "--auto-continue-prompt";
 const WRAPPER_LIMIT_FLAG = "--auto-continue-limit";
+const WRAPPER_NTFY_TOPIC_FLAG = "--auto-continue-ntfy-topic";
+const WRAPPER_NTFY_BASE_URL_FLAG = "--auto-continue-ntfy-base-url";
+const WRAPPER_NOTIFY_TIMEOUT_MS_FLAG = "--auto-continue-notify-timeout-ms";
+const DEFAULT_NTFY_BASE_URL = "https://ntfy.sh";
+const DEFAULT_NOTIFY_TIMEOUT_MS = 3000;
 const DEBUG_LOG_PATH =
   process.env.CODEX_AUTO_CONTINUE_DEBUG_LOG ||
   path.join(os.tmpdir(), "codex-auto-continue-debug.log");
@@ -43,11 +48,87 @@ function isHelpOrVersionArg(arg) {
   return arg === "--help" || arg === "-h" || arg === "--version" || arg === "-V";
 }
 
+function parsePositiveInteger(flagName, value) {
+  if (!/^[1-9]\d*$/.test(value)) {
+    throw new Error(`${flagName} must be a positive integer`);
+  }
+
+  return Number.parseInt(value, 10);
+}
+
+function normalizeOptionalString(value) {
+  if (typeof value !== "string") {
+    return null;
+  }
+
+  const trimmed = value.trim();
+  return trimmed.length === 0 ? null : trimmed;
+}
+
+function validateNtfyBaseUrl(flagName, value) {
+  let parsed;
+  try {
+    parsed = new URL(value);
+  } catch {
+    throw new Error(`${flagName} must be a valid http(s) URL`);
+  }
+
+  if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
+    throw new Error(`${flagName} must be a valid http(s) URL`);
+  }
+
+  return value;
+}
+
+function parsePositiveIntegerEnv(varName) {
+  const value = normalizeOptionalString(process.env[varName]);
+  if (value === null) {
+    return null;
+  }
+
+  return parsePositiveInteger(varName, value);
+}
+
+function resolveNtfySettings(parsed) {
+  const ntfyTopic =
+    parsed.autoContinueNtfyTopic ??
+    normalizeOptionalString(process.env.CODEX_AUTO_CONTINUE_NTFY_TOPIC);
+  if (ntfyTopic === null) {
+    return {
+      ntfyBaseUrl: null,
+      ntfyTopic: null,
+      notifyTimeoutMs: null,
+    };
+  }
+
+  const ntfyBaseUrl = validateNtfyBaseUrl(
+    parsed.autoContinueNtfyBaseUrl === null
+      ? "CODEX_AUTO_CONTINUE_NTFY_BASE_URL"
+      : WRAPPER_NTFY_BASE_URL_FLAG,
+    parsed.autoContinueNtfyBaseUrl ??
+      normalizeOptionalString(process.env.CODEX_AUTO_CONTINUE_NTFY_BASE_URL) ??
+      DEFAULT_NTFY_BASE_URL,
+  );
+  const notifyTimeoutMs =
+    parsed.autoContinueNotifyTimeoutMs ??
+    parsePositiveIntegerEnv("CODEX_AUTO_CONTINUE_NOTIFY_TIMEOUT_MS") ??
+    DEFAULT_NOTIFY_TIMEOUT_MS;
+
+  return {
+    ntfyBaseUrl,
+    ntfyTopic,
+    notifyTimeoutMs,
+  };
+}
+
 function parseWrapperArgs(argv) {
   const passthrough = [];
   let autoContinue = null;
   let autoPrompt = "继续";
   let autoLimit = null;
+  let autoContinueNtfyTopic = null;
+  let autoContinueNtfyBaseUrl = null;
+  let autoContinueNotifyTimeoutMs = null;
 
   for (let index = 0; index < argv.length; index += 1) {
     const arg = argv[index];
@@ -78,11 +159,46 @@ function parseWrapperArgs(argv) {
         throw new Error(`${WRAPPER_LIMIT_FLAG} requires a value`);
       }
 
-      if (!/^[1-9]\d*$/.test(value)) {
-        throw new Error(`${WRAPPER_LIMIT_FLAG} must be a positive integer`);
-      }
+      autoLimit = parsePositiveInteger(WRAPPER_LIMIT_FLAG, value);
+      index += 1;
+      continue;
+    }
 
-      autoLimit = Number.parseInt(value, 10);
+    if (arg === WRAPPER_NTFY_TOPIC_FLAG) {
+      const value = argv[index + 1];
+      if (value === undefined) {
+        throw new Error(`${WRAPPER_NTFY_TOPIC_FLAG} requires a value`);
+      }
+      if (value.trim().length === 0) {
+        throw new Error(`${WRAPPER_NTFY_TOPIC_FLAG} must not be empty`);
+      }
+      autoContinueNtfyTopic = value;
+      index += 1;
+      continue;
+    }
+
+    if (arg === WRAPPER_NTFY_BASE_URL_FLAG) {
+      const value = argv[index + 1];
+      if (value === undefined) {
+        throw new Error(`${WRAPPER_NTFY_BASE_URL_FLAG} requires a value`);
+      }
+      autoContinueNtfyBaseUrl = validateNtfyBaseUrl(
+        WRAPPER_NTFY_BASE_URL_FLAG,
+        value,
+      );
+      index += 1;
+      continue;
+    }
+
+    if (arg === WRAPPER_NOTIFY_TIMEOUT_MS_FLAG) {
+      const value = argv[index + 1];
+      if (value === undefined) {
+        throw new Error(`${WRAPPER_NOTIFY_TIMEOUT_MS_FLAG} requires a value`);
+      }
+      autoContinueNotifyTimeoutMs = parsePositiveInteger(
+        WRAPPER_NOTIFY_TIMEOUT_MS_FLAG,
+        value,
+      );
       index += 1;
       continue;
     }
@@ -97,6 +213,9 @@ function parseWrapperArgs(argv) {
   return {
     autoContinue,
     autoLimit,
+    autoContinueNtfyBaseUrl,
+    autoContinueNtfyTopic,
+    autoContinueNotifyTimeoutMs,
     autoPrompt,
     passthrough,
   };
@@ -263,6 +382,16 @@ async function main() {
     console.error(`[codex-auto-continue] debug log: ${DEBUG_LOG_PATH}`);
   }
 
+  const ntfySettings = resolveNtfySettings(parsed);
+  if (ntfySettings.ntfyTopic !== null) {
+    console.error(
+      `[codex-auto-continue] ntfy notifications enabled for topic ${JSON.stringify(
+        ntfySettings.ntfyTopic,
+      )} via ${ntfySettings.ntfyBaseUrl} ` +
+        `(timeout ${ntfySettings.notifyTimeoutMs}ms).`,
+    );
+  }
+
   const [pythonCommand, ...pythonArgs] = python;
   await spawnAndMirror(pythonCommand, [
     ...pythonArgs,
@@ -276,6 +405,16 @@ async function main() {
     ...(parsed.autoLimit === null
       ? []
       : ["--limit", String(parsed.autoLimit)]),
+    ...(ntfySettings.ntfyTopic === null
+      ? []
+      : [
+          "--ntfy-topic",
+          ntfySettings.ntfyTopic,
+          "--ntfy-base-url",
+          ntfySettings.ntfyBaseUrl,
+          "--notify-timeout-ms",
+          String(ntfySettings.notifyTimeoutMs),
+        ]),
     "--",
     ...parsed.passthrough,
   ]);

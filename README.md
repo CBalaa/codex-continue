@@ -105,6 +105,50 @@ codex --auto-continue --auto-continue-prompt "继续"
 codex --auto-continue --auto-continue-limit 3
 ```
 
+在每次自动发送“继续”之前，把 Codex 本轮最终输出推送到 ntfy：
+
+```bash
+codex --auto-continue --auto-continue-ntfy-topic your-topic
+```
+
+指定自建 ntfy 服务和通知超时（毫秒）：
+
+```bash
+codex --auto-continue \
+  --auto-continue-ntfy-topic your-topic \
+  --auto-continue-ntfy-base-url https://ntfy.example.com \
+  --auto-continue-notify-timeout-ms 5000
+```
+
+也可以长期放到环境变量里：
+
+类 Unix：
+
+```bash
+export CODEX_AUTO_CONTINUE_NTFY_TOPIC=your-topic
+export CODEX_AUTO_CONTINUE_NTFY_BASE_URL=https://ntfy.sh
+export CODEX_AUTO_CONTINUE_NOTIFY_TIMEOUT_MS=3000
+codex --auto-continue
+```
+
+Windows PowerShell：
+
+```powershell
+$env:CODEX_AUTO_CONTINUE_NTFY_TOPIC = "your-topic"
+$env:CODEX_AUTO_CONTINUE_NTFY_BASE_URL = "https://ntfy.sh"
+$env:CODEX_AUTO_CONTINUE_NOTIFY_TIMEOUT_MS = "3000"
+codex --auto-continue
+```
+
+通知正文会包含：
+
+- 当前 `cwd`
+- 本轮最后一条用户输入
+- Codex 的最终输出（`last-assistant-message`）
+
+如果 ntfy 推送失败，当前版本会记 debug 日志，然后仍然继续自动发送“继续”。
+这属于 best-effort 行为，避免续跑被外部通知服务卡住。
+
 ## 调试
 
 打开调试输出：
@@ -133,3 +177,4 @@ codex
 - 自动续跑模式依赖 Python；类 Unix 会查找 `python3` / `python`，Windows 会查找 `python` / `py -3`。
 - 安装脚本现在可以识别 Windows 下的 npm shim（如 `codex.cmd`）并定位真实的 `bin/codex.js`。
 - 注入的是本次启动专用的 `notify` override，不会改写你的 `~/.codex/config.toml`。
+- ntfy 很适合手机接收：装官方 app 后订阅同一个 topic 即可；也可以换成自建 ntfy 服务。

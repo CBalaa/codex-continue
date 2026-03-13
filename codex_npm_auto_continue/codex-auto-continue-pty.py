@@ -13,8 +13,12 @@ import sys
 import tempfile
 import threading
 import time
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
+from urllib import error as urllib_error
+from urllib import parse as urllib_parse
+from urllib import request as urllib_request
 
 AUTO_SEND_DELAY_SECONDS = 0.2
 CHAR_SEND_INTERVAL_SECONDS = 0.03
@@ -23,6 +27,9 @@ DISABLE_GUARD_SECONDS = 1.0
 CTRL_C = 3
 ESC = 27
 LOCALHOST = "127.0.0.1"
+DEFAULT_NTFY_BASE_URL = "https://ntfy.sh"
+DEFAULT_NOTIFY_TIMEOUT_MS = 3000
+NTFY_NOTIFICATION_TITLE = "Codex turn complete"
 
 if os.name == "nt":
     import ctypes
@@ -217,6 +224,13 @@ if os.name == "nt":
     kernel32.WriteFile.restype = wintypes.BOOL
 
 
+@dataclass(frozen=True)
+class NtfyConfig:
+    topic: str
+    base_url: str
+    timeout_seconds: float
+
+
 def build_notify_override(
     python_argv: list[str], notifier_path: Path, host: str, port: int
 ) -> str:
@@ -236,6 +250,110 @@ def create_notify_socket() -> tuple[socket.socket, str, int]:
     notify_socket.bind((LOCALHOST, 0))
     host, port = notify_socket.getsockname()
     return notify_socket, host, port
+
+
+def build_ntfy_config(args: argparse.Namespace) -> Optional[NtfyConfig]:
+    topic = (args.ntfy_topic or "").strip()
+    if not topic:
+        return None
+
+    base_url = (args.ntfy_base_url or DEFAULT_NTFY_BASE_URL).strip()
+    if not base_url:
+        raise ValueError("--ntfy-base-url must not be empty when --ntfy-topic is set")
+
+    parsed = urllib_parse.urlsplit(base_url)
+    if parsed.scheme not in ("http", "https") or not parsed.netloc:
+        raise ValueError("--ntfy-base-url must be a valid http(s) URL")
+
+    timeout_ms = args.notify_timeout_ms or DEFAULT_NOTIFY_TIMEOUT_MS
+    return NtfyConfig(
+        topic=topic,
+        base_url=base_url.rstrip("/"),
+        timeout_seconds=timeout_ms / 1000.0,
+    )
+
+
+def coerce_notification_text(value: object) -> Optional[str]:
+    if not isinstance(value, str):
+        return None
+
+    normalized = value.replace("\r\n", "\n").strip()
+    return normalized or None
+
+
+def last_input_message(event: dict[str, object]) -> Optional[str]:
+    input_messages = event.get("input-messages")
+    if not isinstance(input_messages, list):
+        return None
+
+    for message in reversed(input_messages):
+        normalized = coerce_notification_text(message)
+        if normalized is not None:
+            return normalized
+
+    return None
+
+
+def last_assistant_message(event: dict[str, object]) -> str:
+    message = coerce_notification_text(event.get("last-assistant-message"))
+    if message is None:
+        return "turn complete but no assistant message"
+    return message
+
+
+def format_ntfy_message(event: dict[str, object]) -> str:
+    lines: list[str] = []
+
+    cwd = coerce_notification_text(event.get("cwd"))
+    if cwd is not None:
+        lines.append(f"cwd: {cwd}")
+
+    user_message = last_input_message(event)
+    if user_message is not None:
+        if lines:
+            lines.append("")
+        lines.append("user:")
+        lines.append(user_message)
+
+    if lines:
+        lines.append("")
+    lines.append("assistant:")
+    lines.append(last_assistant_message(event))
+    return "\n".join(lines)
+
+
+def build_ntfy_publish_url(base_url: str, topic: str) -> str:
+    return f"{base_url}/{urllib_parse.quote(topic, safe='')}"
+
+
+def send_ntfy_notification(config: NtfyConfig, event: dict[str, object]) -> None:
+    request = urllib_request.Request(
+        build_ntfy_publish_url(config.base_url, config.topic),
+        data=format_ntfy_message(event).encode("utf-8"),
+        headers={
+            "Content-Type": "text/plain; charset=utf-8",
+            "Title": NTFY_NOTIFICATION_TITLE,
+        },
+        method="POST",
+    )
+    with urllib_request.urlopen(request, timeout=config.timeout_seconds) as response:
+        response.read()
+
+
+def maybe_send_turn_notification(
+    config: Optional[NtfyConfig], event: dict[str, object]
+) -> None:
+    if config is None:
+        return
+
+    try:
+        send_ntfy_notification(config, event)
+        debug(
+            "sent ntfy notification before auto-continue "
+            f"for topic {config.topic!r}"
+        )
+    except (OSError, ValueError, urllib_error.URLError) as error:
+        debug(f"ntfy notification failed: {error}")
 
 
 def bare_escape_pressed(data: bytes) -> bool:
@@ -348,6 +466,7 @@ def launch_child_unix(args: argparse.Namespace, passthrough: list[str]) -> int:
             notify_socket,
             args.prompt,
             args.limit,
+            args.ntfy_config,
         )
     finally:
         try:
@@ -371,6 +490,7 @@ def forward_loop_unix(
     notify_socket: socket.socket,
     prompt: str,
     limit: Optional[int],
+    ntfy_config: Optional[NtfyConfig],
 ) -> int:
     stdin_fd = sys.stdin.fileno()
     stdout_fd = sys.stdout.fileno()
@@ -478,6 +598,7 @@ def forward_loop_unix(
                     auto_continue_enabled
                     and event.get("type") == "agent-turn-complete"
                 ):
+                    maybe_send_turn_notification(ntfy_config, event)
                     pending_send_bytes = schedule_send(prompt)
                     debug(
                         "received agent-turn-complete; "
@@ -503,6 +624,7 @@ def drain_queue_nowait(items: queue.Queue) -> list[object]:
             drained.append(items.get_nowait())
         except queue.Empty:
             return drained
+
 
 def launch_child_windows(args: argparse.Namespace, passthrough: list[str]) -> int:
     if not hasattr(kernel32, "CreatePseudoConsole"):
@@ -557,6 +679,7 @@ def launch_child_windows(args: argparse.Namespace, passthrough: list[str]) -> in
             notify_socket,
             args.prompt,
             args.limit,
+            args.ntfy_config,
             stdin_handle,
             stdout_handle,
         )
@@ -896,6 +1019,7 @@ def forward_loop_windows(
     notify_socket: socket.socket,
     prompt: str,
     limit: Optional[int],
+    ntfy_config: Optional[NtfyConfig],
     stdin_handle: wintypes.HANDLE,
     stdout_handle: wintypes.HANDLE,
 ) -> int:
@@ -973,6 +1097,7 @@ def forward_loop_windows(
                 assert isinstance(event, dict)
                 debug(f"notify event={event!r}")
                 if auto_continue_enabled and event.get("type") == "agent-turn-complete":
+                    maybe_send_turn_notification(ntfy_config, event)
                     pending_send_bytes = schedule_send(prompt)
                     debug(
                         "received agent-turn-complete; "
@@ -1017,6 +1142,9 @@ def parse_args() -> tuple[argparse.Namespace, list[str]]:
     parser.add_argument("--launcher", required=True)
     parser.add_argument("--prompt", required=True)
     parser.add_argument("--limit", type=parse_positive_int)
+    parser.add_argument("--ntfy-topic")
+    parser.add_argument("--ntfy-base-url")
+    parser.add_argument("--notify-timeout-ms", type=parse_positive_int)
     parser.add_argument("passthrough", nargs=argparse.REMAINDER)
     args = parser.parse_args()
 
@@ -1028,7 +1156,12 @@ def parse_args() -> tuple[argparse.Namespace, list[str]]:
 
 
 def main() -> int:
-    args, passthrough = parse_args()
+    try:
+        args, passthrough = parse_args()
+        args.ntfy_config = build_ntfy_config(args)
+    except ValueError as error:
+        print(error, file=sys.stderr)
+        return 1
     if os.name == "nt":
         return launch_child_windows(args, passthrough)
     return launch_child_unix(args, passthrough)
