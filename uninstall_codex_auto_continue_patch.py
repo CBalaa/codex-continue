@@ -2,18 +2,17 @@
 
 import argparse
 import os
-import re
 import shutil
 import stat
 from pathlib import Path
 
-WINDOWS_SHIM_SUFFIXES = {".cmd", ".ps1"}
-WINDOWS_SHIM_TOKENS = {
-    "%~dp0": None,
-    "%dp0%": None,
-    "$basedir": None,
-    "${basedir}": None,
-}
+PATCHED_FILES = [
+    "codex-auto-continue-pty.py",
+    "codex-auto-continue-notify.py",
+    "codex-auto-continue-web.html",
+    "codex-auto-continue-web.css",
+    "codex-auto-continue-web.js",
+]
 
 
 def parse_args() -> argparse.Namespace:
@@ -36,49 +35,10 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def resolve_windows_shim_target(shim_path: Path) -> Path:
-    text = shim_path.read_text(encoding="utf-8", errors="ignore")
-    patterns = [
-        r'["\']([^"\'\r\n]*node_modules[^"\'\r\n]*@openai[^"\'\r\n]*codex[^"\'\r\n]*bin[^"\'\r\n]*codex\.js)["\']',
-        r'["\']([^"\'\r\n]*codex\.js)["\']',
-    ]
-    shim_dir = str(shim_path.parent)
-
-    for pattern in patterns:
-        match = re.search(pattern, text, flags=re.IGNORECASE)
-        if not match:
-            continue
-
-        raw_target = match.group(1)
-        for token in WINDOWS_SHIM_TOKENS:
-            raw_target = raw_target.replace(token, shim_dir)
-
-        candidate = Path(raw_target)
-        if not candidate.is_absolute():
-            candidate = shim_path.parent / candidate
-
-        return candidate.resolve()
-
-    raise RuntimeError(
-        "Could not resolve the npm package launcher from Windows shim "
-        f"{shim_path}"
-    )
-
-
 def resolve_launcher_path(codex_path: str) -> Path:
     resolved = Path(os.path.realpath(codex_path)).resolve()
     if resolved.name.lower() == "codex.js":
         return resolved
-
-    if os.name == "nt" and resolved.suffix.lower() in WINDOWS_SHIM_SUFFIXES:
-        launcher_path = resolve_windows_shim_target(resolved)
-        if launcher_path.name.lower() == "codex.js":
-            return launcher_path
-        raise RuntimeError(
-            "Expected the Windows shim to resolve to bin/codex.js, got "
-            f"{launcher_path}"
-        )
-
     raise RuntimeError(
         "Expected the resolved codex launcher to end in bin/codex.js, got "
         f"{resolved}"
@@ -121,8 +81,8 @@ def uninstall_patch(install_dir: Path, keep_backup: bool) -> tuple[Path, Path]:
     shutil.copy2(real_launcher_path, launcher_path)
     ensure_executable(launcher_path)
 
-    remove_if_exists(install_dir / "codex-auto-continue-pty.py")
-    remove_if_exists(install_dir / "codex-auto-continue-notify.py")
+    for filename in PATCHED_FILES:
+        remove_if_exists(install_dir / filename)
 
     if not keep_backup:
         real_launcher_path.unlink()

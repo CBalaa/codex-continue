@@ -19,29 +19,23 @@ const REMOVED_WRAPPER_AUTO_FLAG = "--auto-continue";
 const REMOVED_WRAPPER_NO_AUTO_FLAG = "--no-auto-continue";
 const WRAPPER_PROMPT_FLAG = "--auto-continue-prompt";
 const WRAPPER_LIMIT_FLAG = "--auto-continue-limit";
-const WRAPPER_NTFY_TOPIC_FLAG = "--auto-continue-ntfy-topic";
-const REMOVED_WRAPPER_NTFY_CONTROL_TOPIC_FLAG = "--auto-continue-ntfy-control-topic";
-const WRAPPER_NTFY_BASE_URL_FLAG = "--auto-continue-ntfy-base-url";
-const WRAPPER_NOTIFY_TIMEOUT_MS_FLAG = "--auto-continue-notify-timeout-ms";
-const REMOVED_NTFY_TOPIC_ENV = "CODEX_AUTO_CONTINUE_NTFY_TOPIC";
-const REMOVED_NTFY_CONTROL_TOPIC_ENV = "CODEX_AUTO_CONTINUE_NTFY_CONTROL_TOPIC";
-const DEFAULT_NTFY_BASE_URL = "https://ntfy.sh";
-const DEFAULT_NOTIFY_TIMEOUT_MS = 3000;
-const COMMENT_TOPIC_KEYS = [
-  "codex-remote-ntfy-topic",
-  "codex-remote-topic",
-  "codex-auto-continue-ntfy-topic",
+const REMOVED_WRAPPER_NTFY_TOPIC_FLAG = "--auto-continue-ntfy-topic";
+const REMOVED_WRAPPER_NTFY_BASE_URL_FLAG = "--auto-continue-ntfy-base-url";
+const REMOVED_WRAPPER_NOTIFY_TIMEOUT_MS_FLAG = "--auto-continue-notify-timeout-ms";
+const COMMENT_WEB_BIND_KEYS = [
+  "codex-remote-web-bind",
+  "codex-auto-continue-web-bind",
 ];
-const COMMENT_BASE_URL_KEYS = [
-  "codex-remote-ntfy-base-url",
-  "codex-remote-base-url",
-  "codex-auto-continue-ntfy-base-url",
+const COMMENT_WEB_PORT_KEYS = [
+  "codex-remote-web-port",
+  "codex-auto-continue-web-port",
 ];
-const COMMENT_TIMEOUT_KEYS = [
-  "codex-remote-notify-timeout-ms",
-  "codex-remote-timeout-ms",
-  "codex-auto-continue-notify-timeout-ms",
+const COMMENT_WEB_PASSWORD_KEYS = [
+  "codex-remote-web-password",
+  "codex-auto-continue-web-password",
 ];
+const DEFAULT_WEB_BIND = "127.0.0.1";
+const DEFAULT_WEB_PORT = 8765;
 const DEBUG_LOG_PATH =
   process.env.CODEX_AUTO_CONTINUE_DEBUG_LOG ||
   path.join(os.tmpdir(), "codex-auto-continue-debug.log");
@@ -72,7 +66,6 @@ function parsePositiveInteger(flagName, value) {
   if (!/^[1-9]\d*$/.test(value)) {
     throw new Error(`${flagName} must be a positive integer`);
   }
-
   return Number.parseInt(value, 10);
 }
 
@@ -80,33 +73,8 @@ function normalizeOptionalString(value) {
   if (typeof value !== "string") {
     return null;
   }
-
   const trimmed = value.trim();
   return trimmed.length === 0 ? null : trimmed;
-}
-
-function validateNtfyBaseUrl(flagName, value) {
-  let parsed;
-  try {
-    parsed = new URL(value);
-  } catch {
-    throw new Error(`${flagName} must be a valid http(s) URL`);
-  }
-
-  if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
-    throw new Error(`${flagName} must be a valid http(s) URL`);
-  }
-
-  return value;
-}
-
-function parsePositiveIntegerEnv(varName) {
-  const value = normalizeOptionalString(process.env[varName]);
-  if (value === null) {
-    return null;
-  }
-
-  return parsePositiveInteger(varName, value);
 }
 
 function parseQuotedString(value) {
@@ -114,7 +82,6 @@ function parseQuotedString(value) {
   if (trimmed.length === 0) {
     return "";
   }
-
   if (trimmed.startsWith('"') && trimmed.endsWith('"')) {
     try {
       return JSON.parse(trimmed);
@@ -122,11 +89,9 @@ function parseQuotedString(value) {
       return trimmed.slice(1, -1);
     }
   }
-
   if (trimmed.startsWith("'") && trimmed.endsWith("'")) {
     return trimmed.slice(1, -1);
   }
-
   return trimmed;
 }
 
@@ -145,7 +110,6 @@ function parseConfigAssignment(raw) {
   if (equalsIndex < 0) {
     return null;
   }
-
   return {
     key: raw.slice(0, equalsIndex).trim(),
     value: raw.slice(equalsIndex + 1),
@@ -237,70 +201,45 @@ function parseCommentIntegerSetting(configPath, setting) {
   }
 }
 
-function resolveNtfySettings(parsed) {
-  if (normalizeOptionalString(process.env[REMOVED_NTFY_CONTROL_TOPIC_ENV]) !== null) {
-    throw new Error(
-      `${REMOVED_NTFY_CONTROL_TOPIC_ENV} has been removed; configure the topic in config.toml comments instead.`,
-    );
-  }
-  if (normalizeOptionalString(process.env[REMOVED_NTFY_TOPIC_ENV]) !== null) {
-    throw new Error(
-      `${REMOVED_NTFY_TOPIC_ENV} has been removed; configure the topic in config.toml comments instead.`,
-    );
-  }
-
+function resolveWebSettings(parsed) {
   const configPath = resolveCodexConfigPath(parsed.passthrough);
   if (!existsSync(configPath)) {
     return {
       configExists: false,
       configPath,
-      ntfyBaseUrl: null,
-      ntfyTopic: null,
-      notifyTimeoutMs: null,
+      webBind: null,
+      webPort: null,
+      webPassword: null,
     };
   }
 
   const fileText = readFileSync(configPath, "utf8");
-  const topicSetting = findConfigSetting(fileText, COMMENT_TOPIC_KEYS);
-  const ntfyTopic =
-    topicSetting === null ? null : parseCommentStringSetting(configPath, topicSetting);
-  if (ntfyTopic === null) {
+  const passwordSetting = findConfigSetting(fileText, COMMENT_WEB_PASSWORD_KEYS);
+  if (passwordSetting === null) {
     return {
       configExists: true,
       configPath,
-      ntfyBaseUrl: null,
-      ntfyTopic: null,
-      notifyTimeoutMs: null,
+      webBind: null,
+      webPort: null,
+      webPassword: null,
     };
   }
 
-  const baseUrlSetting = findConfigSetting(fileText, COMMENT_BASE_URL_KEYS);
-  const timeoutSetting = findConfigSetting(fileText, COMMENT_TIMEOUT_KEYS);
-  const ntfyBaseUrl = validateNtfyBaseUrl(
-    parsed.autoContinueNtfyBaseUrl === null
-      ? "CODEX_AUTO_CONTINUE_NTFY_BASE_URL"
-      : WRAPPER_NTFY_BASE_URL_FLAG,
-    parsed.autoContinueNtfyBaseUrl ??
-      normalizeOptionalString(process.env.CODEX_AUTO_CONTINUE_NTFY_BASE_URL) ??
-      (baseUrlSetting === null
-        ? null
-        : parseCommentStringSetting(configPath, baseUrlSetting)) ??
-      DEFAULT_NTFY_BASE_URL,
-  );
-  const notifyTimeoutMs =
-    parsed.autoContinueNotifyTimeoutMs ??
-    parsePositiveIntegerEnv("CODEX_AUTO_CONTINUE_NOTIFY_TIMEOUT_MS") ??
-    (timeoutSetting === null
-      ? null
-      : parseCommentIntegerSetting(configPath, timeoutSetting)) ??
-    DEFAULT_NOTIFY_TIMEOUT_MS;
+  const bindSetting = findConfigSetting(fileText, COMMENT_WEB_BIND_KEYS);
+  const portSetting = findConfigSetting(fileText, COMMENT_WEB_PORT_KEYS);
 
   return {
     configExists: true,
     configPath,
-    ntfyBaseUrl,
-    ntfyTopic,
-    notifyTimeoutMs,
+    webBind:
+      bindSetting === null
+        ? DEFAULT_WEB_BIND
+        : parseCommentStringSetting(configPath, bindSetting),
+    webPort:
+      portSetting === null
+        ? DEFAULT_WEB_PORT
+        : parseCommentIntegerSetting(configPath, portSetting),
+    webPassword: parseCommentStringSetting(configPath, passwordSetting),
   };
 }
 
@@ -309,14 +248,10 @@ function parseWrapperArgs(argv) {
   let launchMode = null;
   let autoPrompt = "继续";
   let autoLimit = null;
-  let autoContinueNtfyBaseUrl = null;
-  let autoContinueNotifyTimeoutMs = null;
 
   function setLaunchMode(nextMode, flagName) {
     if (launchMode !== null && launchMode !== nextMode) {
-      throw new Error(
-        `${flagName} cannot be combined with another launch mode flag.`,
-      );
+      throw new Error(`${flagName} cannot be combined with another launch mode flag.`);
     }
     launchMode = nextMode;
   }
@@ -364,48 +299,17 @@ function parseWrapperArgs(argv) {
       if (value === undefined) {
         throw new Error(`${WRAPPER_LIMIT_FLAG} requires a value`);
       }
-
       autoLimit = parsePositiveInteger(WRAPPER_LIMIT_FLAG, value);
       index += 1;
       continue;
     }
 
-    if (arg === WRAPPER_NTFY_TOPIC_FLAG) {
-      throw new Error(
-        `${WRAPPER_NTFY_TOPIC_FLAG} has been removed; configure the topic in config.toml comments instead.`,
-      );
-    }
-
-    if (arg === REMOVED_WRAPPER_NTFY_CONTROL_TOPIC_FLAG) {
-      throw new Error(
-        `${REMOVED_WRAPPER_NTFY_CONTROL_TOPIC_FLAG} has been removed; configure the topic in config.toml comments instead.`,
-      );
-    }
-
-    if (arg === WRAPPER_NTFY_BASE_URL_FLAG) {
-      const value = argv[index + 1];
-      if (value === undefined) {
-        throw new Error(`${WRAPPER_NTFY_BASE_URL_FLAG} requires a value`);
-      }
-      autoContinueNtfyBaseUrl = validateNtfyBaseUrl(
-        WRAPPER_NTFY_BASE_URL_FLAG,
-        value,
-      );
-      index += 1;
-      continue;
-    }
-
-    if (arg === WRAPPER_NOTIFY_TIMEOUT_MS_FLAG) {
-      const value = argv[index + 1];
-      if (value === undefined) {
-        throw new Error(`${WRAPPER_NOTIFY_TIMEOUT_MS_FLAG} requires a value`);
-      }
-      autoContinueNotifyTimeoutMs = parsePositiveInteger(
-        WRAPPER_NOTIFY_TIMEOUT_MS_FLAG,
-        value,
-      );
-      index += 1;
-      continue;
+    if (
+      arg === REMOVED_WRAPPER_NTFY_TOPIC_FLAG ||
+      arg === REMOVED_WRAPPER_NTFY_BASE_URL_FLAG ||
+      arg === REMOVED_WRAPPER_NOTIFY_TIMEOUT_MS_FLAG
+    ) {
+      throw new Error(`${arg} has been removed; remote control now uses the private web console.`);
     }
 
     passthrough.push(arg);
@@ -418,8 +322,6 @@ function parseWrapperArgs(argv) {
   return {
     launchMode,
     autoLimit,
-    autoContinueNtfyBaseUrl,
-    autoContinueNotifyTimeoutMs,
     autoPrompt,
     passthrough,
   };
@@ -431,7 +333,6 @@ function firstNonOptionArg(argv) {
       return arg;
     }
   }
-
   return null;
 }
 
@@ -439,12 +340,10 @@ function shouldOfferAutoContinue(argv) {
   if (argv.some(isHelpOrVersionArg)) {
     return false;
   }
-
   const firstArg = firstNonOptionArg(argv);
   if (firstArg === null) {
     return true;
   }
-
   return !NON_INTERACTIVE_SUBCOMMANDS.has(firstArg);
 }
 
@@ -453,12 +352,7 @@ function findPython() {
   if (process.env.PYTHON) {
     candidates.push([process.env.PYTHON]);
   }
-
-  if (process.platform === "win32") {
-    candidates.push(["python"], ["py", "-3"], ["py"]);
-  } else {
-    candidates.push(["python3"], ["python"]);
-  }
+  candidates.push(["python3"], ["python"]);
 
   for (const candidate of candidates) {
     const [command, ...prefixArgs] = candidate;
@@ -481,6 +375,14 @@ function formatModeName(mode) {
     return "chat mode";
   }
   return "native mode";
+}
+
+function formatWebUrl(bind, port) {
+  if (bind === "0.0.0.0" || bind === "::") {
+    return `http://127.0.0.1:${port}/`;
+  }
+  const host = bind.includes(":") && !bind.startsWith("[") ? `[${bind}]` : bind;
+  return `http://${host}:${port}/`;
 }
 
 async function spawnAndMirror(command, args, options = {}) {
@@ -529,7 +431,6 @@ async function main() {
   }
 
   const launchMode = parsed.launchMode ?? "chat";
-
   if (launchMode === "native") {
     await spawnAndMirror(process.execPath, [REAL_LAUNCHER, ...parsed.passthrough]);
     return;
@@ -551,9 +452,9 @@ async function main() {
     return;
   }
 
-  let ntfySettings;
+  let webSettings;
   try {
-    ntfySettings = resolveNtfySettings(parsed);
+    webSettings = resolveWebSettings(parsed);
   } catch (error) {
     console.error(
       `[codex-auto-continue] ${error.message} Starting native Codex instead.`,
@@ -562,14 +463,14 @@ async function main() {
     return;
   }
 
-  if (ntfySettings.ntfyTopic === null) {
+  if (webSettings.webPassword === null) {
     const detail =
-      ntfySettings.configExists === false
-        ? `${ntfySettings.configPath} was not found`
-        : `no remote topic is configured in ${ntfySettings.configPath}`;
+      webSettings.configExists === false
+        ? `${webSettings.configPath} was not found`
+        : `no web password is configured in ${webSettings.configPath}`;
     console.error(
       `[codex-auto-continue] ${formatModeName(launchMode)} requested, but ${detail}; starting native Codex. Add ` +
-        `"# codex-remote-topic = \\"your-topic\\"" to enable remote mode.`,
+        `"# codex-remote-web-password = \\\"change-me\\\"" to enable the private web console.`,
     );
     await spawnAndMirror(process.execPath, [REAL_LAUNCHER, ...parsed.passthrough]);
     return;
@@ -578,11 +479,7 @@ async function main() {
   const python = findPython();
   if (!python) {
     console.error(
-      `[codex-auto-continue] ${formatModeName(launchMode)} requires ${
-        process.platform === "win32"
-          ? "python, py -3, or PYTHON"
-          : "python3, python, or PYTHON"
-      } on PATH; starting native Codex.`,
+      `[codex-auto-continue] ${formatModeName(launchMode)} requires python3, python, or PYTHON on PATH; starting native Codex.`,
     );
     await spawnAndMirror(process.execPath, [REAL_LAUNCHER, ...parsed.passthrough]);
     return;
@@ -593,27 +490,27 @@ async function main() {
       `[codex-auto-continue] enabled with prompt ${JSON.stringify(parsed.autoPrompt)} ` +
         `and limit ${
           parsed.autoLimit === null ? "unlimited sends" : `${parsed.autoLimit} sends`
-        }; ` +
-        "press bare Esc or Ctrl+C to switch to manual mode.",
+        }; press bare Esc or Ctrl+C to switch to manual mode.`,
     );
   } else {
     console.error(
-      "[codex-auto-continue] chat mode enabled; waiting for remote ntfy messages; " +
+      "[codex-auto-continue] chat mode enabled; open the private web console to send messages; " +
         "press bare Esc or Ctrl+C to switch to manual mode.",
     );
   }
+
   if (process.env.CODEX_AUTO_CONTINUE_DEBUG === "1") {
     console.error(`[codex-auto-continue] debug log: ${DEBUG_LOG_PATH}`);
   }
 
-  if (ntfySettings.ntfyTopic !== null) {
-    console.error(
-      `[codex-auto-continue] ntfy single-topic JSON mode on ${JSON.stringify(
-        ntfySettings.ntfyTopic,
-      )} from ${ntfySettings.configPath} via ${ntfySettings.ntfyBaseUrl} ` +
-        `(timeout ${ntfySettings.notifyTimeoutMs}ms).`,
-    );
-  }
+  console.error(
+    `[codex-auto-continue] private web console on ${JSON.stringify(
+      formatWebUrl(webSettings.webBind, webSettings.webPort),
+    )} from ${webSettings.configPath}.`,
+  );
+  console.error(
+    "[codex-auto-continue] the helper will print a startup control key for this Codex instance.",
+  );
 
   const [pythonCommand, ...pythonArgs] = python;
   await spawnAndMirror(pythonCommand, [
@@ -627,19 +524,13 @@ async function main() {
     launchMode,
     "--prompt",
     parsed.autoPrompt,
-    ...(parsed.autoLimit === null
-      ? []
-      : ["--limit", String(parsed.autoLimit)]),
-    ...(ntfySettings.ntfyTopic === null
-      ? []
-      : [
-          "--ntfy-topic",
-          ntfySettings.ntfyTopic,
-          "--ntfy-base-url",
-          ntfySettings.ntfyBaseUrl,
-          "--notify-timeout-ms",
-          String(ntfySettings.notifyTimeoutMs),
-        ]),
+    ...(parsed.autoLimit === null ? [] : ["--limit", String(parsed.autoLimit)]),
+    "--web-bind",
+    webSettings.webBind,
+    "--web-port",
+    String(webSettings.webPort),
+    "--web-password",
+    webSettings.webPassword,
     "--",
     ...parsed.passthrough,
   ]);

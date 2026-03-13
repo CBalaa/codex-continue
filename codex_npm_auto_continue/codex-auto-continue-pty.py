@@ -3,246 +3,56 @@
 from __future__ import annotations
 
 import argparse
+import copy
 import json
 import os
+import pty
 import queue
+import secrets
 import shutil
 import socket
-import subprocess
 import sys
 import tempfile
 import threading
 import time
 from collections import deque
 from dataclasses import dataclass
+from http import cookies
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Optional
-from urllib import error as urllib_error
-from urllib import parse as urllib_parse
-from urllib import request as urllib_request
+
+import fcntl
+import select
+import signal
+import termios
+import tty
 
 AUTO_SEND_DELAY_SECONDS = 0.2
 CHAR_SEND_INTERVAL_SECONDS = 0.03
 CONTROL_POLL_INTERVAL_SECONDS = 0.1
-CONTROL_RECONNECT_DELAY_SECONDS = 1.0
-CONTROL_STREAM_TIMEOUT_SECONDS = 90.0
 ESC_HOTKEY_DISAMBIGUATION_SECONDS = 0.1
-QUEUE_KEY = b"\t"
 DISABLE_GUARD_SECONDS = 1.0
+SSE_KEEPALIVE_SECONDS = 15.0
+MAX_RECENT_EVENTS = 40
+MAX_REQUEST_BODY_BYTES = 65536
+MAX_SSE_QUEUE_SIZE = 32
+QUEUE_KEY = b"\t"
 CTRL_C = 3
 ESC = 27
 LOCALHOST = "127.0.0.1"
-DEFAULT_NTFY_BASE_URL = "https://ntfy.sh"
-DEFAULT_NOTIFY_TIMEOUT_MS = 3000
 MANUAL_MODE = "manual"
 AUTO_MODE = "auto"
 CHAT_MODE = "chat"
 AUTO_SOURCE = "auto"
 CHAT_SOURCE = "chat"
+LOCAL_SOURCE = "local"
 USER_SENDER = "user"
 CODEX_SENDER = "codex"
-NTFY_TURN_NOTIFICATION_TITLE = "Codex turn complete"
-NTFY_CONTROL_NOTIFICATION_TITLE = "Codex remote control"
-NTFY_CONTROL_ERROR_TITLE = "Codex remote control error"
-
-if os.name == "nt":
-    import ctypes
-    import msvcrt
-    from ctypes import wintypes
-else:
-    import fcntl
-    import pty
-    import select
-    import signal
-    import termios
-    import tty
-
-
-if os.name == "nt":
-    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
-
-    STD_INPUT_HANDLE = ctypes.c_ulong(-10).value
-    STD_OUTPUT_HANDLE = ctypes.c_ulong(-11).value
-    ENABLE_PROCESSED_INPUT = 0x0001
-    ENABLE_LINE_INPUT = 0x0002
-    ENABLE_ECHO_INPUT = 0x0004
-    ENABLE_QUICK_EDIT_MODE = 0x0040
-    ENABLE_EXTENDED_FLAGS = 0x0080
-    ENABLE_VIRTUAL_TERMINAL_INPUT = 0x0200
-    ENABLE_PROCESSED_OUTPUT = 0x0001
-    ENABLE_VIRTUAL_TERMINAL_PROCESSING = 0x0004
-    PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE = 0x00020016
-    EXTENDED_STARTUPINFO_PRESENT = 0x00080000
-    WAIT_OBJECT_0 = 0
-    WAIT_TIMEOUT = 258
-    ERROR_BROKEN_PIPE = 109
-    ERROR_INVALID_HANDLE = 6
-    CP_UTF8 = 65001
-
-    class COORD(ctypes.Structure):
-        _fields_ = [
-            ("X", ctypes.c_short),
-            ("Y", ctypes.c_short),
-        ]
-
-    class SMALL_RECT(ctypes.Structure):
-        _fields_ = [
-            ("Left", ctypes.c_short),
-            ("Top", ctypes.c_short),
-            ("Right", ctypes.c_short),
-            ("Bottom", ctypes.c_short),
-        ]
-
-    class CONSOLE_SCREEN_BUFFER_INFO(ctypes.Structure):
-        _fields_ = [
-            ("dwSize", COORD),
-            ("dwCursorPosition", COORD),
-            ("wAttributes", wintypes.WORD),
-            ("srWindow", SMALL_RECT),
-            ("dwMaximumWindowSize", COORD),
-        ]
-
-    LPBYTE = ctypes.POINTER(wintypes.BYTE)
-
-    class STARTUPINFOW(ctypes.Structure):
-        _fields_ = [
-            ("cb", wintypes.DWORD),
-            ("lpReserved", wintypes.LPWSTR),
-            ("lpDesktop", wintypes.LPWSTR),
-            ("lpTitle", wintypes.LPWSTR),
-            ("dwX", wintypes.DWORD),
-            ("dwY", wintypes.DWORD),
-            ("dwXSize", wintypes.DWORD),
-            ("dwYSize", wintypes.DWORD),
-            ("dwXCountChars", wintypes.DWORD),
-            ("dwYCountChars", wintypes.DWORD),
-            ("dwFillAttribute", wintypes.DWORD),
-            ("dwFlags", wintypes.DWORD),
-            ("wShowWindow", wintypes.WORD),
-            ("cbReserved2", wintypes.WORD),
-            ("lpReserved2", LPBYTE),
-            ("hStdInput", wintypes.HANDLE),
-            ("hStdOutput", wintypes.HANDLE),
-            ("hStdError", wintypes.HANDLE),
-        ]
-
-    class STARTUPINFOEXW(ctypes.Structure):
-        _fields_ = [
-            ("StartupInfo", STARTUPINFOW),
-            ("lpAttributeList", ctypes.c_void_p),
-        ]
-
-    class PROCESS_INFORMATION(ctypes.Structure):
-        _fields_ = [
-            ("hProcess", wintypes.HANDLE),
-            ("hThread", wintypes.HANDLE),
-            ("dwProcessId", wintypes.DWORD),
-            ("dwThreadId", wintypes.DWORD),
-        ]
-
-    kernel32.GetStdHandle.argtypes = [wintypes.DWORD]
-    kernel32.GetStdHandle.restype = wintypes.HANDLE
-    kernel32.GetConsoleMode.argtypes = [wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD)]
-    kernel32.GetConsoleMode.restype = wintypes.BOOL
-    kernel32.SetConsoleMode.argtypes = [wintypes.HANDLE, wintypes.DWORD]
-    kernel32.SetConsoleMode.restype = wintypes.BOOL
-    kernel32.GetConsoleCP.argtypes = []
-    kernel32.GetConsoleCP.restype = wintypes.UINT
-    kernel32.SetConsoleCP.argtypes = [wintypes.UINT]
-    kernel32.SetConsoleCP.restype = wintypes.BOOL
-    kernel32.GetConsoleOutputCP.argtypes = []
-    kernel32.GetConsoleOutputCP.restype = wintypes.UINT
-    kernel32.SetConsoleOutputCP.argtypes = [wintypes.UINT]
-    kernel32.SetConsoleOutputCP.restype = wintypes.BOOL
-    kernel32.GetConsoleScreenBufferInfo.argtypes = [
-        wintypes.HANDLE,
-        ctypes.POINTER(CONSOLE_SCREEN_BUFFER_INFO),
-    ]
-    kernel32.GetConsoleScreenBufferInfo.restype = wintypes.BOOL
-    kernel32.CreatePipe.argtypes = [
-        ctypes.POINTER(wintypes.HANDLE),
-        ctypes.POINTER(wintypes.HANDLE),
-        ctypes.c_void_p,
-        wintypes.DWORD,
-    ]
-    kernel32.CreatePipe.restype = wintypes.BOOL
-    if hasattr(kernel32, "CreatePseudoConsole"):
-        kernel32.CreatePseudoConsole.argtypes = [
-            COORD,
-            wintypes.HANDLE,
-            wintypes.HANDLE,
-            wintypes.DWORD,
-            ctypes.POINTER(wintypes.HANDLE),
-        ]
-        kernel32.CreatePseudoConsole.restype = ctypes.c_long
-        kernel32.ResizePseudoConsole.argtypes = [wintypes.HANDLE, COORD]
-        kernel32.ResizePseudoConsole.restype = ctypes.c_long
-        kernel32.ClosePseudoConsole.argtypes = [wintypes.HANDLE]
-        kernel32.ClosePseudoConsole.restype = None
-    kernel32.InitializeProcThreadAttributeList.argtypes = [
-        ctypes.c_void_p,
-        wintypes.DWORD,
-        wintypes.DWORD,
-        ctypes.POINTER(ctypes.c_size_t),
-    ]
-    kernel32.InitializeProcThreadAttributeList.restype = wintypes.BOOL
-    kernel32.UpdateProcThreadAttribute.argtypes = [
-        ctypes.c_void_p,
-        wintypes.DWORD,
-        ctypes.c_size_t,
-        ctypes.c_void_p,
-        ctypes.c_size_t,
-        ctypes.c_void_p,
-        ctypes.POINTER(ctypes.c_size_t),
-    ]
-    kernel32.UpdateProcThreadAttribute.restype = wintypes.BOOL
-    kernel32.DeleteProcThreadAttributeList.argtypes = [ctypes.c_void_p]
-    kernel32.DeleteProcThreadAttributeList.restype = None
-    kernel32.CreateProcessW.argtypes = [
-        wintypes.LPCWSTR,
-        wintypes.LPWSTR,
-        ctypes.c_void_p,
-        ctypes.c_void_p,
-        wintypes.BOOL,
-        wintypes.DWORD,
-        ctypes.c_void_p,
-        wintypes.LPCWSTR,
-        ctypes.POINTER(STARTUPINFOEXW),
-        ctypes.POINTER(PROCESS_INFORMATION),
-    ]
-    kernel32.CreateProcessW.restype = wintypes.BOOL
-    kernel32.WaitForSingleObject.argtypes = [wintypes.HANDLE, wintypes.DWORD]
-    kernel32.WaitForSingleObject.restype = wintypes.DWORD
-    kernel32.GetExitCodeProcess.argtypes = [
-        wintypes.HANDLE,
-        ctypes.POINTER(wintypes.DWORD),
-    ]
-    kernel32.GetExitCodeProcess.restype = wintypes.BOOL
-    kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
-    kernel32.CloseHandle.restype = wintypes.BOOL
-    kernel32.ReadFile.argtypes = [
-        wintypes.HANDLE,
-        ctypes.c_void_p,
-        wintypes.DWORD,
-        ctypes.POINTER(wintypes.DWORD),
-        ctypes.c_void_p,
-    ]
-    kernel32.ReadFile.restype = wintypes.BOOL
-    kernel32.WriteFile.argtypes = [
-        wintypes.HANDLE,
-        ctypes.c_void_p,
-        wintypes.DWORD,
-        ctypes.POINTER(wintypes.DWORD),
-        ctypes.c_void_p,
-    ]
-    kernel32.WriteFile.restype = wintypes.BOOL
-
-
-@dataclass(frozen=True)
-class NtfyConfig:
-    topic: str
-    base_url: str
-    timeout_seconds: float
+SESSION_COOKIE_NAME = "codex_remote_session"
+STATIC_HTML = "codex-auto-continue-web.html"
+STATIC_CSS = "codex-auto-continue-web.css"
+STATIC_JS = "codex-auto-continue-web.js"
 
 
 @dataclass
@@ -278,6 +88,461 @@ class StdinHotkeyState:
     pending_escape_deadline: Optional[float] = None
 
 
+@dataclass(frozen=True)
+class QueuedControlCommand:
+    summary: str
+    command: RemoteCommand
+
+
+class WebConsoleStateHub:
+    def __init__(self, bind: str, port: int, password: str, control_key: str):
+        self.bind = bind
+        self.port = port
+        self.password = password
+        self.control_key = control_key
+        self.control_key_hint = mask_secret(control_key)
+        self.listen_url = build_listen_url(bind, port)
+        self._lock = threading.Lock()
+        self._runtime: dict[str, object] = {
+            "mode": MANUAL_MODE,
+            "status": "idle",
+            "turn_in_flight": False,
+            "queued_chat_messages": 0,
+            "remaining_total": 0,
+            "current_task_remaining": None,
+            "current_task_message": None,
+            "auto_tasks": [],
+        }
+        self._recent_events: deque[dict[str, object]] = deque(maxlen=MAX_RECENT_EVENTS)
+        self._latest_assistant: Optional[dict[str, object]] = None
+        self._latest_control: Optional[dict[str, object]] = None
+        self._sessions: set[str] = set()
+        self._subscribers: set[queue.Queue] = set()
+        self._next_event_id = 1
+        self._next_request_id = 1
+
+    def next_request_summary(self) -> str:
+        with self._lock:
+            request_id = self._next_request_id
+            self._next_request_id += 1
+        return f"web:{request_id}"
+
+    def verify_password(self, candidate: str) -> bool:
+        return secrets.compare_digest(candidate, self.password)
+
+    def verify_control_key(self, candidate: str) -> bool:
+        return secrets.compare_digest(candidate, self.control_key)
+
+    def create_session(self) -> str:
+        token = secrets.token_urlsafe(32)
+        with self._lock:
+            self._sessions.add(token)
+        return token
+
+    def delete_session(self, token: Optional[str]) -> None:
+        if token is None:
+            return
+        with self._lock:
+            self._sessions.discard(token)
+
+    def has_session(self, token: Optional[str]) -> bool:
+        if token is None:
+            return False
+        with self._lock:
+            return token in self._sessions
+
+    def subscribe(self) -> queue.Queue:
+        subscriber: queue.Queue = queue.Queue(maxsize=MAX_SSE_QUEUE_SIZE)
+        with self._lock:
+            self._subscribers.add(subscriber)
+            snapshot = self._build_snapshot_locked()
+        self._enqueue_snapshot(subscriber, snapshot)
+        return subscriber
+
+    def unsubscribe(self, subscriber: queue.Queue) -> None:
+        with self._lock:
+            self._subscribers.discard(subscriber)
+
+    def snapshot(self) -> dict[str, object]:
+        with self._lock:
+            return self._build_snapshot_locked()
+
+    def publish_runtime(self, state: SessionState) -> None:
+        self._publish(runtime=build_state_payload(state))
+
+    def publish_control_response(
+        self, state: SessionState, body: str, error: bool = False
+    ) -> None:
+        payload = build_control_response_payload(state, body, error)
+        self._publish(
+            runtime=build_state_payload(state),
+            recent_event=self._build_recent_event(
+                "control-error" if error else "control-response",
+                payload,
+            ),
+            latest_control=payload,
+        )
+
+    def publish_turn_complete(
+        self, event: dict[str, object], state: SessionState
+    ) -> None:
+        payload = build_turn_notification_payload(event, state)
+        self._publish(
+            runtime=build_state_payload(state),
+            recent_event=self._build_recent_event("assistant", payload),
+            latest_assistant=payload,
+        )
+
+    def publish_system_event(self, state: SessionState, title: str, text: str) -> None:
+        payload = {
+            "sender": CODEX_SENDER,
+            "type": "system-event",
+            "title": title,
+            "text": text,
+            **build_state_payload(state),
+        }
+        self._publish(
+            runtime=build_state_payload(state),
+            recent_event=self._build_recent_event("system", payload),
+        )
+
+    def _publish(
+        self,
+        runtime: Optional[dict[str, object]] = None,
+        recent_event: Optional[dict[str, object]] = None,
+        latest_assistant: Optional[dict[str, object]] = None,
+        latest_control: Optional[dict[str, object]] = None,
+    ) -> None:
+        with self._lock:
+            if runtime is not None:
+                self._runtime = copy.deepcopy(runtime)
+            if recent_event is not None:
+                self._recent_events.appendleft(copy.deepcopy(recent_event))
+            if latest_assistant is not None:
+                self._latest_assistant = copy.deepcopy(latest_assistant)
+            if latest_control is not None:
+                self._latest_control = copy.deepcopy(latest_control)
+            snapshot = self._build_snapshot_locked()
+            subscribers = list(self._subscribers)
+        self._broadcast_snapshot(subscribers, snapshot)
+
+    def _build_recent_event(
+        self, kind: str, payload: dict[str, object]
+    ) -> dict[str, object]:
+        with self._lock:
+            event_id = self._next_event_id
+            self._next_event_id += 1
+        return {
+            "id": event_id,
+            "timestamp": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime()),
+            "kind": kind,
+            "type": payload.get("type"),
+            "title": payload.get("title") or default_event_title(kind),
+            "text": coerce_notification_text(payload.get("text")) or "",
+            "assistant": payload.get("assistant"),
+            "user": payload.get("user"),
+            "mode": payload.get("mode"),
+            "status": payload.get("status"),
+        }
+
+    def _build_snapshot_locked(self) -> dict[str, object]:
+        return {
+            **copy.deepcopy(self._runtime),
+            "listen_url": self.listen_url,
+            "control_key_hint": self.control_key_hint,
+            "recent_events": list(copy.deepcopy(self._recent_events)),
+            "latest_assistant": copy.deepcopy(self._latest_assistant),
+            "latest_control": copy.deepcopy(self._latest_control),
+        }
+
+    def _broadcast_snapshot(
+        self, subscribers: list[queue.Queue], snapshot: dict[str, object]
+    ) -> None:
+        stale: list[queue.Queue] = []
+        for subscriber in subscribers:
+            if not self._enqueue_snapshot(subscriber, snapshot):
+                stale.append(subscriber)
+        if stale:
+            with self._lock:
+                for subscriber in stale:
+                    self._subscribers.discard(subscriber)
+
+    def _enqueue_snapshot(
+        self, subscriber: queue.Queue, snapshot: dict[str, object]
+    ) -> bool:
+        event = {"type": "snapshot", "snapshot": copy.deepcopy(snapshot)}
+        try:
+            subscriber.put_nowait(event)
+            return True
+        except queue.Full:
+            try:
+                subscriber.get_nowait()
+            except queue.Empty:
+                pass
+            try:
+                subscriber.put_nowait(event)
+                return True
+            except queue.Full:
+                return False
+
+
+class RemoteControlHTTPServer(ThreadingHTTPServer):
+    daemon_threads = True
+    allow_reuse_address = True
+
+    def __init__(
+        self,
+        server_address: tuple[str, int],
+        handler_class: type[BaseHTTPRequestHandler],
+        hub: WebConsoleStateHub,
+        control_queue: queue.Queue,
+        stop_event: threading.Event,
+        static_dir: Path,
+    ):
+        super().__init__(server_address, handler_class)
+        self.hub = hub
+        self.control_queue = control_queue
+        self.stop_event = stop_event
+        self.static_dir = static_dir
+
+
+class RemoteControlRequestHandler(BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+
+    def do_GET(self) -> None:
+        if self.path in ("/", "/login"):
+            self.serve_static(STATIC_HTML, "text/html; charset=utf-8")
+            return
+        if self.path == f"/{STATIC_CSS}":
+            self.serve_static(STATIC_CSS, "text/css; charset=utf-8")
+            return
+        if self.path == f"/{STATIC_JS}":
+            self.serve_static(STATIC_JS, "application/javascript; charset=utf-8")
+            return
+        if self.path == "/api/state":
+            if not self.require_auth():
+                return
+            self.send_json(200, self.server.hub.snapshot())
+            return
+        if self.path == "/api/events":
+            if not self.require_auth():
+                return
+            self.handle_sse()
+            return
+        self.send_error(404)
+
+    def do_POST(self) -> None:
+        if self.path == "/login":
+            self.handle_login()
+            return
+        if self.path == "/logout":
+            self.handle_logout()
+            return
+        if self.path == "/api/command":
+            if not self.require_auth():
+                return
+            self.handle_command()
+            return
+        self.send_error(404)
+
+    def log_message(self, format: str, *args: object) -> None:
+        debug(f"web {self.address_string()} {format % args}")
+
+    def serve_static(self, filename: str, content_type: str) -> None:
+        path = self.server.static_dir / filename
+        if not path.exists():
+            self.send_error(404)
+            return
+        try:
+            payload = path.read_bytes()
+        except OSError:
+            self.send_error(500)
+            return
+        self.send_response(200)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(len(payload)))
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        self.wfile.write(payload)
+
+    def handle_login(self) -> None:
+        payload = self.read_json_body()
+        if payload is None:
+            return
+        if not isinstance(payload, dict):
+            self.send_json(400, {"error": "request body must be a JSON object"})
+            return
+        password = coerce_notification_text(payload.get("password"))
+        if password is None:
+            self.send_json(400, {"error": '"password" must be a non-empty string'})
+            return
+        control_key = coerce_notification_text(payload.get("control_key"))
+        if control_key is None:
+            self.send_json(400, {"error": '"control_key" must be a non-empty string'})
+            return
+        if not self.server.hub.verify_password(password) or not self.server.hub.verify_control_key(
+            control_key
+        ):
+            self.send_json(401, {"error": "invalid password or control key"})
+            return
+        token = self.server.hub.create_session()
+        response = {"ok": True, "snapshot": self.server.hub.snapshot()}
+        payload_bytes = encode_json(response)
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(payload_bytes)))
+        self.send_header(
+            "Set-Cookie",
+            f"{SESSION_COOKIE_NAME}={token}; HttpOnly; SameSite=Strict; Path=/",
+        )
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        self.wfile.write(payload_bytes)
+
+    def handle_logout(self) -> None:
+        self.server.hub.delete_session(self.current_session_token())
+        payload_bytes = encode_json({"ok": True})
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(payload_bytes)))
+        self.send_header(
+            "Set-Cookie",
+            f"{SESSION_COOKIE_NAME}=; HttpOnly; Max-Age=0; SameSite=Strict; Path=/",
+        )
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        self.wfile.write(payload_bytes)
+
+    def handle_command(self) -> None:
+        payload = self.read_json_body()
+        if payload is None:
+            return
+        if not isinstance(payload, dict):
+            self.send_json(400, {"error": "request body must be a JSON object"})
+            return
+        raw_message = json.dumps(payload, ensure_ascii=False)
+        try:
+            command = parse_remote_command_message(raw_message)
+        except ValueError as error:
+            self.send_json(400, {"error": str(error)})
+            return
+        if command is None:
+            self.send_json(400, {"error": 'control messages must include "sender":"user"'})
+            return
+        self.server.control_queue.put(
+            QueuedControlCommand(
+                summary=self.server.hub.next_request_summary(),
+                command=command,
+            )
+        )
+        self.send_json(202, {"accepted": True})
+
+    def handle_sse(self) -> None:
+        subscriber = self.server.hub.subscribe()
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("Connection", "keep-alive")
+        self.end_headers()
+        try:
+            while not self.server.stop_event.is_set():
+                try:
+                    event = subscriber.get(timeout=SSE_KEEPALIVE_SECONDS)
+                except queue.Empty:
+                    self.wfile.write(b": keepalive\n\n")
+                    self.wfile.flush()
+                    continue
+                payload = json.dumps(event, ensure_ascii=False, separators=(",", ":"))
+                self.wfile.write(b"event: snapshot\n")
+                self.wfile.write(f"data: {payload}\n\n".encode("utf-8"))
+                self.wfile.flush()
+        except (BrokenPipeError, ConnectionResetError, OSError):
+            pass
+        finally:
+            self.server.hub.unsubscribe(subscriber)
+
+    def read_json_body(self) -> Optional[object]:
+        content_length = self.headers.get("Content-Length")
+        try:
+            size = int(content_length or "0")
+        except ValueError:
+            self.send_json(400, {"error": "invalid Content-Length"})
+            return None
+        if size <= 0:
+            self.send_json(400, {"error": "request body must not be empty"})
+            return None
+        if size > MAX_REQUEST_BODY_BYTES:
+            self.send_json(413, {"error": "request body is too large"})
+            return None
+        try:
+            raw = self.rfile.read(size)
+        except OSError:
+            self.send_json(400, {"error": "failed to read request body"})
+            return None
+        try:
+            return json.loads(raw.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            self.send_json(400, {"error": "request body must be valid JSON"})
+            return None
+
+    def current_session_token(self) -> Optional[str]:
+        raw_cookie = self.headers.get("Cookie")
+        if not raw_cookie:
+            return None
+        jar = cookies.SimpleCookie()
+        try:
+            jar.load(raw_cookie)
+        except cookies.CookieError:
+            return None
+        morsel = jar.get(SESSION_COOKIE_NAME)
+        if morsel is None:
+            return None
+        token = morsel.value.strip()
+        return token or None
+
+    def require_auth(self) -> bool:
+        if self.server.hub.has_session(self.current_session_token()):
+            return True
+        self.send_json(401, {"error": "authentication required"})
+        return False
+
+    def send_json(self, status_code: int, payload: dict[str, object]) -> None:
+        payload_bytes = encode_json(payload)
+        self.send_response(status_code)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(payload_bytes)))
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        self.wfile.write(payload_bytes)
+
+
+def build_listen_url(bind: str, port: int) -> str:
+    if bind in ("0.0.0.0", "::"):
+        return f"http://127.0.0.1:{port}/"
+    host = bind if ":" not in bind or bind.startswith("[") else f"[{bind}]"
+    return f"http://{host}:{port}/"
+
+
+def mask_secret(value: str) -> str:
+    if len(value) <= 8:
+        return value
+    return f"{value[:4]}...{value[-4:]}"
+
+
+def default_event_title(kind: str) -> str:
+    if kind == "assistant":
+        return "Turn complete"
+    if kind == "control-response":
+        return "Control receipt"
+    if kind == "control-error":
+        return "Control error"
+    return "System event"
+
+
+def encode_json(payload: object) -> bytes:
+    return json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+
+
 def build_notify_override(
     python_argv: list[str], notifier_path: Path, host: str, port: int
 ) -> str:
@@ -299,31 +564,9 @@ def create_notify_socket() -> tuple[socket.socket, str, int]:
     return notify_socket, host, port
 
 
-def build_ntfy_config(args: argparse.Namespace) -> Optional[NtfyConfig]:
-    topic = (args.ntfy_topic or "").strip()
-    if not topic:
-        return None
-
-    base_url = (args.ntfy_base_url or DEFAULT_NTFY_BASE_URL).strip()
-    if not base_url:
-        raise ValueError("--ntfy-base-url must not be empty when --ntfy-topic is set")
-
-    parsed = urllib_parse.urlsplit(base_url)
-    if parsed.scheme not in ("http", "https") or not parsed.netloc:
-        raise ValueError("--ntfy-base-url must be a valid http(s) URL")
-
-    timeout_ms = args.notify_timeout_ms or DEFAULT_NOTIFY_TIMEOUT_MS
-    return NtfyConfig(
-        topic=topic,
-        base_url=base_url.rstrip("/"),
-        timeout_seconds=timeout_ms / 1000.0,
-    )
-
-
 def coerce_notification_text(value: object) -> Optional[str]:
     if not isinstance(value, str):
         return None
-
     normalized = value.replace("\r\n", "\n").strip()
     return normalized or None
 
@@ -332,12 +575,10 @@ def last_input_message(event: dict[str, object]) -> Optional[str]:
     input_messages = event.get("input-messages")
     if not isinstance(input_messages, list):
         return None
-
     for message in reversed(input_messages):
         normalized = coerce_notification_text(message)
         if normalized is not None:
             return normalized
-
     return None
 
 
@@ -378,11 +619,7 @@ def build_initial_session_state(
     mode: str, prompt: str, limit: Optional[int]
 ) -> SessionState:
     if mode == CHAT_MODE:
-        return SessionState(
-            mode=CHAT_MODE,
-            auto_tasks=deque(),
-            chat_queue=deque(),
-        )
+        return SessionState(mode=CHAT_MODE, auto_tasks=deque(), chat_queue=deque())
     return SessionState(
         mode=AUTO_MODE,
         auto_tasks=deque([AutoTask(message=prompt, remaining=limit)]),
@@ -391,32 +628,34 @@ def build_initial_session_state(
 
 
 def build_state_payload(state: SessionState) -> dict[str, object]:
-    payload: dict[str, object] = {"mode": state.mode}
-    if state.mode == AUTO_MODE:
-        payload["remaining_total"] = total_auto_remaining(state.auto_tasks)
-        task = current_auto_task(state)
-        if task is not None:
-            payload["current_task_remaining"] = task.remaining
-            payload["current_task_message"] = task.message
-    elif state.mode == CHAT_MODE:
-        payload["queued_chat_messages"] = len(state.chat_queue)
-    return payload
+    task = current_auto_task(state)
+    return {
+        "mode": state.mode,
+        "status": "executing" if state.turn_in_flight else "idle",
+        "turn_in_flight": state.turn_in_flight,
+        "queued_chat_messages": len(state.chat_queue),
+        "remaining_total": total_auto_remaining(state.auto_tasks)
+        if state.auto_tasks
+        else 0,
+        "current_task_remaining": None if task is None else task.remaining,
+        "current_task_message": None if task is None else task.message,
+        "auto_tasks": [
+            {"message": task.message, "remaining": task.remaining}
+            for task in state.auto_tasks
+        ],
+    }
 
 
 def summarize_state_lines(state: SessionState) -> list[str]:
-    lines = [f"mode: {state.mode}"]
-    if state.mode == AUTO_MODE:
-        lines.append(
-            f"remaining-total: {format_remaining_count(total_auto_remaining(state.auto_tasks))}"
-        )
-        task = current_auto_task(state)
-        if task is not None:
-            lines.append(
-                f"current-task-remaining: {format_remaining_count(task.remaining)}"
-            )
-            append_text_block(lines, "current-task-message", task.message)
-    elif state.mode == CHAT_MODE:
-        lines.append(f"queued-chat-messages: {len(state.chat_queue)}")
+    lines = [f"mode: {state.mode}", f"status: {'executing' if state.turn_in_flight else 'idle'}"]
+    lines.append(f"queued-chat-messages: {len(state.chat_queue)}")
+    lines.append(
+        f"remaining-total: {format_remaining_count(total_auto_remaining(state.auto_tasks)) if state.auto_tasks else '0'}"
+    )
+    task = current_auto_task(state)
+    if task is not None:
+        lines.append(f"current-task-remaining: {format_remaining_count(task.remaining)}")
+        append_text_block(lines, "current-task-message", task.message)
     return lines
 
 
@@ -447,6 +686,7 @@ def build_turn_notification_payload(
     payload: dict[str, object] = {
         "sender": CODEX_SENDER,
         "type": "turn-complete",
+        "title": "Turn complete",
         "text": format_turn_notification(event, state),
         **build_state_payload(state),
     }
@@ -491,85 +731,10 @@ def build_control_response_payload(
     return {
         "sender": CODEX_SENDER,
         "type": "control-error" if error else "control-response",
+        "title": "Control error" if error else "Control receipt",
         "text": body,
         **build_state_payload(state),
     }
-
-
-def build_ntfy_topic_url(base_url: str, topic: str) -> str:
-    return f"{base_url}/{urllib_parse.quote(topic, safe='')}"
-
-
-def build_ntfy_stream_url(base_url: str, topic: str, since: str) -> str:
-    query = urllib_parse.urlencode({"since": since})
-    return f"{build_ntfy_topic_url(base_url, topic)}/json?{query}"
-
-
-def serialize_ntfy_body(body: object) -> tuple[bytes, str]:
-    if isinstance(body, dict):
-        return (
-            json.dumps(body, ensure_ascii=False, separators=(",", ":")).encode("utf-8"),
-            "application/json; charset=utf-8",
-        )
-    if isinstance(body, str):
-        return body.encode("utf-8"), "text/plain; charset=utf-8"
-    raise TypeError("unsupported ntfy body type")
-
-
-def send_ntfy_message(config: NtfyConfig, title: str, body: object) -> None:
-    payload_bytes, content_type = serialize_ntfy_body(body)
-    request = urllib_request.Request(
-        build_ntfy_topic_url(config.base_url, config.topic),
-        data=payload_bytes,
-        headers={
-            "Content-Type": content_type,
-            "Title": title,
-        },
-        method="POST",
-    )
-    with urllib_request.urlopen(request, timeout=config.timeout_seconds) as response:
-        response.read()
-
-
-def maybe_send_ntfy_message(
-    config: Optional[NtfyConfig], title: str, body: object, context: str
-) -> None:
-    if config is None:
-        return
-
-    try:
-        send_ntfy_message(config, title, body)
-        debug(
-            f"sent ntfy {context} notification "
-            f"for topic {config.topic!r}"
-        )
-    except (OSError, ValueError, urllib_error.URLError) as error:
-        debug(f"ntfy {context} notification failed: {error}")
-
-
-def maybe_send_turn_notification(
-    config: Optional[NtfyConfig], event: dict[str, object], state: SessionState
-) -> None:
-    maybe_send_ntfy_message(
-        config,
-        NTFY_TURN_NOTIFICATION_TITLE,
-        build_turn_notification_payload(event, state),
-        "turn",
-    )
-
-
-def maybe_send_control_response(
-    config: Optional[NtfyConfig],
-    state: SessionState,
-    body: str,
-    error: bool = False,
-) -> None:
-    maybe_send_ntfy_message(
-        config,
-        NTFY_CONTROL_ERROR_TITLE if error else NTFY_CONTROL_NOTIFICATION_TITLE,
-        build_control_response_payload(state, body, error),
-        "control",
-    )
 
 
 def is_positive_int(value: object) -> bool:
@@ -683,16 +848,13 @@ def commit_scheduled_send(state: SessionState, scheduled: ScheduledSend) -> None
         state.chat_queue.popleft()
 
 
-def maybe_finalize_idle_mode(
-    state: SessionState, config: Optional[NtfyConfig]
-) -> None:
+def maybe_finalize_idle_mode(state: SessionState, hub: WebConsoleStateHub) -> None:
     if state.turn_in_flight:
         return
 
     if state.mode == AUTO_MODE and not state.auto_tasks:
         state.mode = MANUAL_MODE
-        maybe_send_control_response(
-            config,
+        hub.publish_control_response(
             state,
             format_control_response(
                 state,
@@ -747,13 +909,6 @@ def apply_remote_command(state: SessionState, command: RemoteCommand) -> str:
     )
 
 
-def build_control_message_summary(event: dict[str, object]) -> str:
-    message_id = coerce_notification_text(event.get("id"))
-    if message_id is None:
-        return "remote"
-    return f"remote:{message_id}"
-
-
 def should_cancel_pending_send(
     command: RemoteCommand, current_send: Optional[ScheduledSend], turn_in_flight: bool
 ) -> bool:
@@ -766,112 +921,17 @@ def should_cancel_pending_send(
     return current_send.source == AUTO_SOURCE
 
 
-def process_control_message(
+def process_control_command(
     state: SessionState,
-    config: Optional[NtfyConfig],
-    event: dict[str, object],
+    hub: WebConsoleStateHub,
+    request: QueuedControlCommand,
     current_send: Optional[ScheduledSend],
 ) -> bool:
-    raw_message = coerce_notification_text(event.get("message"))
-    if raw_message is None:
-        maybe_send_control_response(
-            config,
-            state,
-            format_control_response(
-                state,
-                build_control_message_summary(event),
-                "error",
-                "control message body must be a non-empty string",
-            ),
-            error=True,
-        )
-        return False
-
-    try:
-        command = parse_remote_command_message(raw_message)
-    except ValueError as error:
-        maybe_send_control_response(
-            config,
-            state,
-            format_control_response(
-                state,
-                build_control_message_summary(event),
-                "error",
-                str(error),
-            ),
-            error=True,
-        )
-        return False
-
-    if command is None:
-        return False
-
-    cancel_pending = should_cancel_pending_send(command, current_send, state.turn_in_flight)
-    maybe_send_control_response(config, state, apply_remote_command(state, command))
+    cancel_pending = should_cancel_pending_send(
+        request.command, current_send, state.turn_in_flight
+    )
+    hub.publish_control_response(state, apply_remote_command(state, request.command))
     return cancel_pending
-
-
-def start_ntfy_control_listener(
-    config: Optional[NtfyConfig],
-    control_queue: queue.Queue,
-    stop_event: threading.Event,
-) -> Optional[threading.Thread]:
-    if config is None:
-        return None
-
-    def worker() -> None:
-        since = str(int(time.time()))
-        last_message_id: Optional[str] = None
-
-        while not stop_event.is_set():
-            request = urllib_request.Request(
-                build_ntfy_stream_url(config.base_url, config.topic, since),
-                method="GET",
-            )
-            try:
-                with urllib_request.urlopen(
-                    request,
-                    timeout=max(config.timeout_seconds, CONTROL_STREAM_TIMEOUT_SECONDS),
-                ) as response:
-                    for raw_line in response:
-                        if stop_event.is_set():
-                            return
-
-                        line = raw_line.decode("utf-8").strip()
-                        if not line:
-                            continue
-
-                        try:
-                            event = json.loads(line)
-                        except json.JSONDecodeError:
-                            debug(f"control stream payload parse failed: {line!r}")
-                            continue
-
-                        if not isinstance(event, dict):
-                            continue
-                        if event.get("event") != "message":
-                            continue
-
-                        message_id = event.get("id")
-                        if isinstance(message_id, str) and message_id:
-                            if message_id == last_message_id:
-                                continue
-                            last_message_id = message_id
-                            since = message_id
-
-                        control_queue.put(event)
-            except (
-                OSError,
-                UnicodeDecodeError,
-                ValueError,
-                urllib_error.URLError,
-            ) as error:
-                debug(f"control listener reconnecting after error: {error}")
-                stop_event.wait(CONTROL_RECONNECT_DELAY_SECONDS)
-
-    thread = threading.Thread(target=worker, name="codex-auto-continue-control", daemon=True)
-    thread.start()
-    return thread
 
 
 def flush_pending_stdin_hotkey(
@@ -972,12 +1032,14 @@ def schedule_submission(
     return scheduled, schedule_send(scheduled.message)
 
 
-def disable_session_automation(
-    state: SessionState,
-) -> None:
+def disable_session_automation(state: SessionState) -> None:
     state.mode = MANUAL_MODE
     state.auto_tasks.clear()
     state.chat_queue.clear()
+
+
+def is_local_submit_bytes(data: bytes) -> bool:
+    return data.endswith(b"\r") or data.endswith(b"\n")
 
 
 def parse_positive_int(value: str) -> int:
@@ -988,7 +1050,6 @@ def parse_positive_int(value: str) -> int:
 
     if parsed <= 0:
         raise argparse.ArgumentTypeError("must be a positive integer")
-
     return parsed
 
 
@@ -1007,6 +1068,43 @@ def build_child_argv(
         build_notify_override(current_python_argv(), notifier_path, host, port),
         *passthrough,
     ]
+
+
+def copy_winsize_unix(source_fd: int, target_fd: int) -> None:
+    try:
+        packed = fcntl.ioctl(source_fd, termios.TIOCGWINSZ, b"\x00" * 8)
+        fcntl.ioctl(target_fd, termios.TIOCSWINSZ, packed)
+    except OSError:
+        pass
+
+
+def start_web_console(
+    bind: str,
+    port: int,
+    password: str,
+    control_key: str,
+    control_queue: queue.Queue,
+    stop_event: threading.Event,
+    initial_state: SessionState,
+) -> tuple[RemoteControlHTTPServer, threading.Thread, WebConsoleStateHub]:
+    hub = WebConsoleStateHub(bind, port, password, control_key)
+    hub.publish_runtime(initial_state)
+    server = RemoteControlHTTPServer(
+        (bind, port),
+        RemoteControlRequestHandler,
+        hub,
+        control_queue,
+        stop_event,
+        Path(__file__).resolve().parent,
+    )
+    thread = threading.Thread(
+        target=server.serve_forever,
+        kwargs={"poll_interval": 0.2},
+        name="codex-auto-continue-web",
+        daemon=True,
+    )
+    thread.start()
+    return server, thread, hub
 
 
 def launch_child_unix(args: argparse.Namespace, passthrough: list[str]) -> int:
@@ -1035,7 +1133,9 @@ def launch_child_unix(args: argparse.Namespace, passthrough: list[str]) -> int:
             args.mode,
             args.prompt,
             args.limit,
-            args.ntfy_config,
+            args.web_bind,
+            args.web_port,
+            args.web_password,
         )
     finally:
         try:
@@ -1045,14 +1145,6 @@ def launch_child_unix(args: argparse.Namespace, passthrough: list[str]) -> int:
         notify_socket.close()
 
 
-def copy_winsize_unix(source_fd: int, target_fd: int) -> None:
-    try:
-        packed = fcntl.ioctl(source_fd, termios.TIOCGWINSZ, b"\x00" * 8)
-        fcntl.ioctl(target_fd, termios.TIOCSWINSZ, packed)
-    except OSError:
-        pass
-
-
 def forward_loop_unix(
     child_pid: int,
     master_fd: int,
@@ -1060,71 +1152,93 @@ def forward_loop_unix(
     mode: str,
     prompt: str,
     limit: Optional[int],
-    ntfy_config: Optional[NtfyConfig],
+    web_bind: str,
+    web_port: int,
+    web_password: str,
 ) -> int:
     stdin_fd = sys.stdin.fileno()
     stdout_fd = sys.stdout.fileno()
     stderr_fd = sys.stderr.fileno()
-    stdin_is_tty = os.isatty(stdin_fd)
-    old_tty_settings = None
+    old_tty_settings = termios.tcgetattr(stdin_fd)
     session_state = build_initial_session_state(mode, prompt, limit)
     pending_send_bytes: list[tuple[float, bytes]] = []
     pending_submission: Optional[ScheduledSend] = None
+    active_turn_source: Optional[str] = None
     stdin_hotkey_state = StdinHotkeyState()
     disable_allowed_at = time.monotonic() + DISABLE_GUARD_SECONDS
     stop_event = threading.Event()
     control_queue: queue.Queue = queue.Queue()
-    control_thread = start_ntfy_control_listener(ntfy_config, control_queue, stop_event)
+    control_key = secrets.token_urlsafe(18)
+    web_server, web_thread, hub = start_web_console(
+        web_bind,
+        web_port,
+        web_password,
+        control_key,
+        control_queue,
+        stop_event,
+        session_state,
+    )
 
-    if stdin_is_tty:
-        old_tty_settings = termios.tcgetattr(stdin_fd)
-        tty.setraw(stdin_fd)
-        try:
-            termios.tcflush(stdin_fd, termios.TCIFLUSH)
-            debug("flushed pending stdin after launch-mode prompt")
-        except termios.error as error:
-            debug(f"stdin flush failed: {error}")
+    os.write(
+        stderr_fd,
+        (
+            "[codex-auto-continue] control key for this Codex: "
+            f"{control_key}\r\n"
+        ).encode("utf-8"),
+    )
+    os.write(
+        stderr_fd,
+        b"[codex-auto-continue] enter this key in the web console login form.\r\n",
+    )
+
+    tty.setraw(stdin_fd)
+    try:
+        termios.tcflush(stdin_fd, termios.TCIFLUSH)
+        debug("flushed pending stdin after launch-mode prompt")
+    except termios.error as error:
+        debug(f"stdin flush failed: {error}")
+    copy_winsize_unix(stdin_fd, master_fd)
+
+    def on_sigwinch(_signum, _frame) -> None:
         copy_winsize_unix(stdin_fd, master_fd)
-    else:
-        debug("stdin is not a tty; disable hotkeys are unavailable")
-
-    def on_sigwinch(_signum, _frame):
-        if stdin_is_tty:
-            copy_winsize_unix(stdin_fd, master_fd)
 
     previous_sigwinch = signal.getsignal(signal.SIGWINCH)
     signal.signal(signal.SIGWINCH, on_sigwinch)
-
     disable_notice_shown = False
 
     try:
         while True:
             now = time.monotonic()
-            if stdin_is_tty:
-                hotkey_bytes, disable_candidate = flush_pending_stdin_hotkey(
-                    stdin_hotkey_state, now
-                )
-                if hotkey_bytes:
-                    debug(f"stdin hotkey flush bytes={hotkey_bytes!r}")
-                    if disable_candidate and now >= disable_allowed_at:
-                        disable_session_automation(session_state)
-                        pending_send_bytes.clear()
-                        pending_submission = None
-                        if not disable_notice_shown:
-                            os.write(
-                                stderr_fd,
-                                b"\r\n[codex-auto-continue] switched to manual mode.\r\n",
-                            )
-                            disable_notice_shown = True
-                        debug(f"disabled by buffered stdin hotkey {hotkey_bytes!r}")
-                    os.write(master_fd, hotkey_bytes)
+            hotkey_bytes, disable_candidate = flush_pending_stdin_hotkey(
+                stdin_hotkey_state, now
+            )
+            if hotkey_bytes:
+                debug(f"stdin hotkey flush bytes={hotkey_bytes!r}")
+                if disable_candidate and now >= disable_allowed_at:
+                    disable_session_automation(session_state)
+                    pending_send_bytes.clear()
+                    pending_submission = None
+                    active_turn_source = None
+                    hub.publish_system_event(
+                        session_state,
+                        "Manual mode",
+                        "switched to manual mode from local keyboard",
+                    )
+                    if not disable_notice_shown:
+                        os.write(
+                            stderr_fd,
+                            b"\r\n[codex-auto-continue] switched to manual mode.\r\n",
+                        )
+                        disable_notice_shown = True
+                    debug(f"disabled by buffered stdin hotkey {hotkey_bytes!r}")
+                os.write(master_fd, hotkey_bytes)
 
             for control_event in drain_queue_nowait(control_queue):
-                assert isinstance(control_event, dict)
+                assert isinstance(control_event, QueuedControlCommand)
                 debug(f"control event={control_event!r}")
-                if process_control_message(
+                if process_control_command(
                     session_state,
-                    ntfy_config,
+                    hub,
                     control_event,
                     pending_submission,
                 ):
@@ -1132,7 +1246,7 @@ def forward_loop_unix(
                     pending_submission = None
                     debug("cleared pending scheduled send after control update")
 
-            maybe_finalize_idle_mode(session_state, ntfy_config)
+            maybe_finalize_idle_mode(session_state, hub)
             pending_submission, new_send_bytes = schedule_submission(
                 session_state, pending_submission
             )
@@ -1145,41 +1259,32 @@ def forward_loop_unix(
                 if chunk == QUEUE_KEY:
                     debug("sent queue key")
                     if pending_submission is not None:
+                        active_turn_source = pending_submission.source
                         debug(
                             "committing scheduled submission "
                             f"{pending_submission.source}:{pending_submission.message!r}"
                         )
                         commit_scheduled_send(session_state, pending_submission)
                         pending_submission = None
+                        hub.publish_runtime(session_state)
                 else:
                     debug(f"sent text chunk {chunk!r}")
 
             timeout = None
             if pending_send_bytes:
                 timeout = max(0.0, pending_send_bytes[0][0] - now)
-            if (
-                stdin_is_tty
-                and stdin_hotkey_state.pending_escape_deadline is not None
-            ):
+            if stdin_hotkey_state.pending_escape_deadline is not None:
                 hotkey_timeout = max(
                     0.0, stdin_hotkey_state.pending_escape_deadline - now
                 )
-                timeout = (
-                    hotkey_timeout
-                    if timeout is None
-                    else min(timeout, hotkey_timeout)
-                )
-            if control_thread is not None:
-                timeout = (
-                    CONTROL_POLL_INTERVAL_SECONDS
-                    if timeout is None
-                    else min(timeout, CONTROL_POLL_INTERVAL_SECONDS)
-                )
+                timeout = hotkey_timeout if timeout is None else min(timeout, hotkey_timeout)
+            timeout = (
+                CONTROL_POLL_INTERVAL_SECONDS
+                if timeout is None
+                else min(timeout, CONTROL_POLL_INTERVAL_SECONDS)
+            )
 
-            read_fds = [master_fd, notify_socket.fileno()]
-            if stdin_is_tty:
-                read_fds.append(stdin_fd)
-
+            read_fds = [master_fd, notify_socket.fileno(), stdin_fd]
             ready, _, _ = select.select(read_fds, [], [], timeout)
 
             if master_fd in ready:
@@ -1191,7 +1296,7 @@ def forward_loop_unix(
                     break
                 os.write(stdout_fd, data)
 
-            if stdin_is_tty and stdin_fd in ready:
+            if stdin_fd in ready:
                 data = os.read(stdin_fd, 1024)
                 if not data:
                     continue
@@ -1204,14 +1309,17 @@ def forward_loop_unix(
                 if not data and not disable_candidate:
                     continue
                 helper_send_in_progress = bool(pending_send_bytes)
-                if (
-                    disable_candidate
-                    and time.monotonic() >= disable_allowed_at
-                ):
+                if disable_candidate and time.monotonic() >= disable_allowed_at:
                     disable_session_automation(session_state)
                     pending_send_bytes.clear()
                     pending_submission = None
+                    active_turn_source = None
                     helper_send_in_progress = False
+                    hub.publish_system_event(
+                        session_state,
+                        "Manual mode",
+                        "switched to manual mode from local keyboard",
+                    )
                     if not disable_notice_shown:
                         os.write(
                             stderr_fd,
@@ -1222,6 +1330,11 @@ def forward_loop_unix(
                 if helper_send_in_progress:
                     debug(f"suppressed stdin during scheduled send: {data!r}")
                     continue
+                if is_local_submit_bytes(data) and not session_state.turn_in_flight:
+                    session_state.turn_in_flight = True
+                    active_turn_source = LOCAL_SOURCE
+                    hub.publish_runtime(session_state)
+                    debug("marked local turn as in flight")
                 os.write(master_fd, data)
 
             if notify_socket.fileno() in ready:
@@ -1233,14 +1346,24 @@ def forward_loop_unix(
                     continue
                 debug(f"notify event={event!r}")
                 if event.get("type") == "agent-turn-complete":
+                    completed_turn_source = active_turn_source
                     session_state.turn_in_flight = False
-                    maybe_send_turn_notification(ntfy_config, event, session_state)
-                    maybe_finalize_idle_mode(session_state, ntfy_config)
+                    active_turn_source = None
+                    if completed_turn_source in (AUTO_SOURCE, CHAT_SOURCE):
+                        hub.publish_turn_complete(event, session_state)
+                    elif completed_turn_source == LOCAL_SOURCE:
+                        debug("suppressed local turn notification from web feed")
+                    else:
+                        hub.publish_turn_complete(event, session_state)
+                    maybe_finalize_idle_mode(session_state, hub)
+                    hub.publish_runtime(session_state)
     finally:
         stop_event.set()
         signal.signal(signal.SIGWINCH, previous_sigwinch)
-        if old_tty_settings is not None:
-            termios.tcsetattr(stdin_fd, termios.TCSADRAIN, old_tty_settings)
+        termios.tcsetattr(stdin_fd, termios.TCSADRAIN, old_tty_settings)
+        web_server.shutdown()
+        web_server.server_close()
+        web_thread.join(timeout=1.0)
 
     _, status = os.waitpid(child_pid, 0)
     if os.WIFSIGNALED(status):
@@ -1259,571 +1382,6 @@ def drain_queue_nowait(items: queue.Queue) -> list[object]:
             return drained
 
 
-def launch_child_windows(args: argparse.Namespace, passthrough: list[str]) -> int:
-    if not hasattr(kernel32, "CreatePseudoConsole"):
-        raise RuntimeError(
-            "Windows auto-continue requires ConPTY "
-            "(Windows 10 version 1809 or later)."
-        )
-
-    notifier_path = Path(__file__).with_name("codex-auto-continue-notify.py")
-    notify_socket, host, port = create_notify_socket()
-    notify_socket.settimeout(0.2)
-
-    stdin_handle = kernel32.GetStdHandle(STD_INPUT_HANDLE)
-    stdout_handle = kernel32.GetStdHandle(STD_OUTPUT_HANDLE)
-    console_state: Optional[dict[str, Optional[int]]] = None
-    pty_input_read = wintypes.HANDLE()
-    pty_input_write = wintypes.HANDLE()
-    pty_output_read = wintypes.HANDLE()
-    pty_output_write = wintypes.HANDLE()
-    pseudo_console = wintypes.HANDLE()
-    process_info = None
-
-    try:
-        console_state = configure_windows_console(stdin_handle, stdout_handle)
-        create_pipe(pty_input_read, pty_input_write)
-        create_pipe(pty_output_read, pty_output_write)
-        create_pseudo_console(
-            pseudo_console,
-            current_console_size(stdout_handle),
-            pty_input_read,
-            pty_output_write,
-        )
-        process_info = create_process_in_pseudo_console(
-            build_child_argv(
-                args.node,
-                args.launcher,
-                passthrough,
-                notifier_path,
-                host,
-                port,
-            ),
-            pseudo_console,
-        )
-        close_handle(pty_input_read)
-        close_handle(pty_output_write)
-
-        return forward_loop_windows(
-            process_info,
-            pseudo_console,
-            pty_input_write,
-            pty_output_read,
-            notify_socket,
-            args.mode,
-            args.prompt,
-            args.limit,
-            args.ntfy_config,
-            stdin_handle,
-            stdout_handle,
-        )
-    finally:
-        try:
-            notify_socket.close()
-        except OSError:
-            pass
-        if process_info is not None:
-            close_handle(process_info.hThread)
-            close_handle(process_info.hProcess)
-        close_pseudo_console(pseudo_console)
-        close_handle(pty_input_read)
-        close_handle(pty_input_write)
-        close_handle(pty_output_read)
-        close_handle(pty_output_write)
-        if console_state is not None:
-            restore_windows_console(stdin_handle, stdout_handle, console_state)
-
-
-def configure_windows_console(
-    stdin_handle: wintypes.HANDLE, stdout_handle: wintypes.HANDLE
-) -> dict[str, Optional[int]]:
-    state: dict[str, Optional[int]] = {
-        "stdin_mode": get_console_mode(stdin_handle),
-        "stdout_mode": get_console_mode(stdout_handle),
-        "input_cp": None,
-        "output_cp": None,
-        "stdout_binary_mode": None,
-    }
-
-    if state["stdin_mode"] is not None:
-        raw_mode = state["stdin_mode"] | ENABLE_EXTENDED_FLAGS | ENABLE_VIRTUAL_TERMINAL_INPUT
-        raw_mode &= ~(
-            ENABLE_ECHO_INPUT | ENABLE_LINE_INPUT | ENABLE_PROCESSED_INPUT | ENABLE_QUICK_EDIT_MODE
-        )
-        set_console_mode(stdin_handle, raw_mode)
-        state["input_cp"] = kernel32.GetConsoleCP()
-        if not kernel32.SetConsoleCP(CP_UTF8):
-            raise ctypes.WinError(ctypes.get_last_error())
-        debug("configured Windows stdin for raw VT input")
-    else:
-        debug("stdin is not a Windows console; disable hotkeys are unavailable")
-
-    if state["stdout_mode"] is not None:
-        vt_mode = state["stdout_mode"] | ENABLE_PROCESSED_OUTPUT | ENABLE_VIRTUAL_TERMINAL_PROCESSING
-        set_console_mode(stdout_handle, vt_mode)
-        state["output_cp"] = kernel32.GetConsoleOutputCP()
-        if not kernel32.SetConsoleOutputCP(CP_UTF8):
-            raise ctypes.WinError(ctypes.get_last_error())
-        debug("configured Windows stdout for VT output")
-
-    try:
-        state["stdout_binary_mode"] = msvcrt.setmode(sys.stdout.fileno(), os.O_BINARY)
-    except OSError:
-        state["stdout_binary_mode"] = None
-
-    return state
-
-
-def restore_windows_console(
-    stdin_handle: wintypes.HANDLE,
-    stdout_handle: wintypes.HANDLE,
-    state: dict[str, Optional[int]],
-) -> None:
-    try:
-        if state.get("stdin_mode") is not None:
-            set_console_mode(stdin_handle, int(state["stdin_mode"]))
-        if state.get("stdout_mode") is not None:
-            set_console_mode(stdout_handle, int(state["stdout_mode"]))
-        if state.get("input_cp") is not None:
-            kernel32.SetConsoleCP(int(state["input_cp"]))
-        if state.get("output_cp") is not None:
-            kernel32.SetConsoleOutputCP(int(state["output_cp"]))
-        if state.get("stdout_binary_mode") is not None:
-            msvcrt.setmode(sys.stdout.fileno(), int(state["stdout_binary_mode"]))
-    except OSError:
-        pass
-
-
-def get_console_mode(handle: wintypes.HANDLE) -> Optional[int]:
-    mode = wintypes.DWORD()
-    if kernel32.GetConsoleMode(handle, ctypes.byref(mode)):
-        return mode.value
-    error = ctypes.get_last_error()
-    if error == ERROR_INVALID_HANDLE:
-        return None
-    raise ctypes.WinError(error)
-
-
-def set_console_mode(handle: wintypes.HANDLE, mode: int) -> None:
-    if not kernel32.SetConsoleMode(handle, mode):
-        raise ctypes.WinError(ctypes.get_last_error())
-
-
-def current_console_size(stdout_handle: wintypes.HANDLE) -> tuple[int, int]:
-    info = CONSOLE_SCREEN_BUFFER_INFO()
-    if not kernel32.GetConsoleScreenBufferInfo(stdout_handle, ctypes.byref(info)):
-        return (120, 30)
-    width = info.srWindow.Right - info.srWindow.Left + 1
-    height = info.srWindow.Bottom - info.srWindow.Top + 1
-    return (max(1, width), max(1, height))
-
-
-def create_pipe(read_handle: wintypes.HANDLE, write_handle: wintypes.HANDLE) -> None:
-    if not kernel32.CreatePipe(ctypes.byref(read_handle), ctypes.byref(write_handle), None, 0):
-        raise ctypes.WinError(ctypes.get_last_error())
-
-
-def create_pseudo_console(
-    pseudo_console: wintypes.HANDLE,
-    size: tuple[int, int],
-    input_read: wintypes.HANDLE,
-    output_write: wintypes.HANDLE,
-) -> None:
-    result = kernel32.CreatePseudoConsole(
-        COORD(size[0], size[1]),
-        input_read,
-        output_write,
-        0,
-        ctypes.byref(pseudo_console),
-    )
-    if result != 0:
-        raise OSError(
-            result,
-            f"CreatePseudoConsole failed with HRESULT 0x{ctypes.c_ulong(result).value:08X}",
-        )
-
-
-def close_pseudo_console(pseudo_console: wintypes.HANDLE) -> None:
-    if pseudo_console and pseudo_console.value:
-        kernel32.ClosePseudoConsole(pseudo_console)
-
-
-def resize_pseudo_console(
-    pseudo_console: wintypes.HANDLE, size: tuple[int, int]
-) -> None:
-    result = kernel32.ResizePseudoConsole(pseudo_console, COORD(size[0], size[1]))
-    if result != 0:
-        debug(
-            "ResizePseudoConsole failed with HRESULT "
-            f"0x{ctypes.c_ulong(result).value:08X}"
-        )
-
-
-def create_process_in_pseudo_console(
-    child_argv: list[str], pseudo_console: wintypes.HANDLE
-) -> PROCESS_INFORMATION:
-    attribute_list_size = ctypes.c_size_t(0)
-    kernel32.InitializeProcThreadAttributeList(None, 1, 0, ctypes.byref(attribute_list_size))
-    attribute_list_buffer = ctypes.create_string_buffer(attribute_list_size.value)
-    attribute_list = ctypes.cast(attribute_list_buffer, ctypes.c_void_p)
-    if not kernel32.InitializeProcThreadAttributeList(
-        attribute_list,
-        1,
-        0,
-        ctypes.byref(attribute_list_size),
-    ):
-        raise ctypes.WinError(ctypes.get_last_error())
-
-    try:
-        if not kernel32.UpdateProcThreadAttribute(
-            attribute_list,
-            0,
-            PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE,
-            pseudo_console,
-            ctypes.sizeof(wintypes.HANDLE),
-            None,
-            None,
-        ):
-            raise ctypes.WinError(ctypes.get_last_error())
-
-        startup_info = STARTUPINFOEXW()
-        startup_info.StartupInfo.cb = ctypes.sizeof(startup_info)
-        startup_info.lpAttributeList = attribute_list
-
-        process_info = PROCESS_INFORMATION()
-        command_line = ctypes.create_unicode_buffer(subprocess.list2cmdline(child_argv))
-        if not kernel32.CreateProcessW(
-            None,
-            command_line,
-            None,
-            None,
-            False,
-            EXTENDED_STARTUPINFO_PRESENT,
-            None,
-            None,
-            ctypes.byref(startup_info),
-            ctypes.byref(process_info),
-        ):
-            raise ctypes.WinError(ctypes.get_last_error())
-        return process_info
-    finally:
-        kernel32.DeleteProcThreadAttributeList(attribute_list)
-
-
-def close_handle(handle: wintypes.HANDLE) -> None:
-    if handle and handle.value:
-        kernel32.CloseHandle(handle)
-        handle.value = None
-
-
-def write_handle_bytes(handle: wintypes.HANDLE, data: bytes) -> None:
-    offset = 0
-    while offset < len(data):
-        chunk = data[offset:]
-        buffer = ctypes.create_string_buffer(chunk)
-        written = wintypes.DWORD()
-        if not kernel32.WriteFile(
-            handle,
-            buffer,
-            len(chunk),
-            ctypes.byref(written),
-            None,
-        ):
-            raise ctypes.WinError(ctypes.get_last_error())
-        if written.value == 0:
-            raise BrokenPipeError("WriteFile returned zero bytes written")
-        offset += written.value
-
-
-def read_handle_bytes(handle: wintypes.HANDLE, size: int) -> bytes:
-    buffer = ctypes.create_string_buffer(size)
-    read = wintypes.DWORD()
-    success = kernel32.ReadFile(handle, buffer, size, ctypes.byref(read), None)
-    if not success:
-        error = ctypes.get_last_error()
-        if error == ERROR_BROKEN_PIPE:
-            return b""
-        raise ctypes.WinError(error)
-    return buffer.raw[: read.value]
-
-
-def start_windows_stdin_reader(
-    stdin_handle: wintypes.HANDLE, stdin_queue: queue.Queue, stop_event: threading.Event
-) -> threading.Thread:
-    stdin_mode = get_console_mode(stdin_handle)
-
-    def worker() -> None:
-        try:
-            if stdin_mode is None:
-                stdin_fd = sys.stdin.fileno()
-                while not stop_event.is_set():
-                    data = os.read(stdin_fd, 1024)
-                    if not data:
-                        break
-                    stdin_queue.put(data)
-                return
-
-            while not stop_event.is_set():
-                data = read_handle_bytes(stdin_handle, 1024)
-                if not data:
-                    continue
-                stdin_queue.put(data)
-        except OSError as error:
-            debug(f"stdin reader stopped: {error}")
-
-    thread = threading.Thread(target=worker, name="codex-auto-continue-stdin", daemon=True)
-    thread.start()
-    return thread
-
-
-def start_windows_output_reader(
-    output_read: wintypes.HANDLE, stop_event: threading.Event
-) -> threading.Thread:
-    stdout_fd = sys.stdout.fileno()
-
-    def worker() -> None:
-        try:
-            while not stop_event.is_set():
-                data = read_handle_bytes(output_read, 65536)
-                if not data:
-                    return
-                os.write(stdout_fd, data)
-        except OSError as error:
-            debug(f"output reader stopped: {error}")
-
-    thread = threading.Thread(target=worker, name="codex-auto-continue-output", daemon=True)
-    thread.start()
-    return thread
-
-
-def start_notify_listener(
-    notify_socket: socket.socket,
-    notify_queue: queue.Queue,
-    stop_event: threading.Event,
-) -> threading.Thread:
-    def worker() -> None:
-        while not stop_event.is_set():
-            try:
-                payload, _ = notify_socket.recvfrom(65536)
-            except socket.timeout:
-                continue
-            except OSError as error:
-                debug(f"notify listener stopped: {error}")
-                return
-
-            try:
-                event = json.loads(payload.decode("utf-8"))
-            except (UnicodeDecodeError, json.JSONDecodeError):
-                debug(f"notify payload parse failed: {payload!r}")
-                continue
-            notify_queue.put(event)
-
-    thread = threading.Thread(target=worker, name="codex-auto-continue-notify", daemon=True)
-    thread.start()
-    return thread
-
-
-def poll_process_exit(process_handle: wintypes.HANDLE) -> Optional[int]:
-    wait_result = kernel32.WaitForSingleObject(process_handle, 0)
-    if wait_result == WAIT_TIMEOUT:
-        return None
-    if wait_result != WAIT_OBJECT_0:
-        raise ctypes.WinError(ctypes.get_last_error())
-    exit_code = wintypes.DWORD()
-    if not kernel32.GetExitCodeProcess(process_handle, ctypes.byref(exit_code)):
-        raise ctypes.WinError(ctypes.get_last_error())
-    return exit_code.value
-
-
-def wait_for_process_exit(process_handle: wintypes.HANDLE) -> int:
-    wait_result = kernel32.WaitForSingleObject(process_handle, 0xFFFFFFFF)
-    if wait_result != WAIT_OBJECT_0:
-        raise ctypes.WinError(ctypes.get_last_error())
-    exit_code = wintypes.DWORD()
-    if not kernel32.GetExitCodeProcess(process_handle, ctypes.byref(exit_code)):
-        raise ctypes.WinError(ctypes.get_last_error())
-    return exit_code.value
-
-
-def forward_loop_windows(
-    process_info: PROCESS_INFORMATION,
-    pseudo_console: wintypes.HANDLE,
-    input_write: wintypes.HANDLE,
-    output_read: wintypes.HANDLE,
-    notify_socket: socket.socket,
-    mode: str,
-    prompt: str,
-    limit: Optional[int],
-    ntfy_config: Optional[NtfyConfig],
-    stdin_handle: wintypes.HANDLE,
-    stdout_handle: wintypes.HANDLE,
-) -> int:
-    session_state = build_initial_session_state(mode, prompt, limit)
-    pending_send_bytes: list[tuple[float, bytes]] = []
-    pending_submission: Optional[ScheduledSend] = None
-    stdin_hotkey_state = StdinHotkeyState()
-    disable_allowed_at = time.monotonic() + DISABLE_GUARD_SECONDS
-    disable_notice_shown = False
-    stop_event = threading.Event()
-    stdin_queue: queue.Queue = queue.Queue()
-    notify_queue: queue.Queue = queue.Queue()
-    control_queue: queue.Queue = queue.Queue()
-    stdin_thread = start_windows_stdin_reader(stdin_handle, stdin_queue, stop_event)
-    output_thread = start_windows_output_reader(output_read, stop_event)
-    notify_thread = start_notify_listener(notify_socket, notify_queue, stop_event)
-    control_thread = start_ntfy_control_listener(ntfy_config, control_queue, stop_event)
-    _ = stdin_thread, notify_thread, control_thread
-    last_console_size = current_console_size(stdout_handle)
-    last_resize_check = 0.0
-    exit_code: Optional[int] = None
-
-    try:
-        while True:
-            now = time.monotonic()
-            hotkey_bytes, disable_candidate = flush_pending_stdin_hotkey(
-                stdin_hotkey_state, now
-            )
-            if hotkey_bytes:
-                debug(f"stdin hotkey flush bytes={hotkey_bytes!r}")
-                if disable_candidate and now >= disable_allowed_at:
-                    disable_session_automation(session_state)
-                    pending_send_bytes.clear()
-                    pending_submission = None
-                    if not disable_notice_shown:
-                        os.write(
-                            sys.stderr.fileno(),
-                            b"\r\n[codex-auto-continue] switched to manual mode.\r\n",
-                        )
-                        disable_notice_shown = True
-                    debug(f"disabled by buffered stdin hotkey {hotkey_bytes!r}")
-                try:
-                    write_handle_bytes(input_write, hotkey_bytes)
-                except OSError:
-                    break
-
-            for control_event in drain_queue_nowait(control_queue):
-                assert isinstance(control_event, dict)
-                debug(f"control event={control_event!r}")
-                if process_control_message(
-                    session_state,
-                    ntfy_config,
-                    control_event,
-                    pending_submission,
-                ):
-                    pending_send_bytes.clear()
-                    pending_submission = None
-                    debug("cleared pending scheduled send after control update")
-
-            maybe_finalize_idle_mode(session_state, ntfy_config)
-            pending_submission, new_send_bytes = schedule_submission(
-                session_state, pending_submission
-            )
-            if new_send_bytes:
-                pending_send_bytes = new_send_bytes
-
-            if pending_send_bytes and now >= pending_send_bytes[0][0]:
-                _, chunk = pending_send_bytes.pop(0)
-                try:
-                    write_handle_bytes(input_write, chunk)
-                except OSError:
-                    break
-                if chunk == QUEUE_KEY:
-                    debug("sent queue key")
-                    if pending_submission is not None:
-                        debug(
-                            "committing scheduled submission "
-                            f"{pending_submission.source}:{pending_submission.message!r}"
-                        )
-                        commit_scheduled_send(session_state, pending_submission)
-                        pending_submission = None
-                else:
-                    debug(f"sent text chunk {chunk!r}")
-                continue
-
-            stop_loop = False
-            for data in drain_queue_nowait(stdin_queue):
-                assert isinstance(data, bytes)
-                debug(f"stdin bytes={data!r}")
-                data, disable_candidate = process_stdin_hotkeys(
-                    stdin_hotkey_state,
-                    data,
-                    time.monotonic(),
-                )
-                if not data and not disable_candidate:
-                    continue
-                helper_send_in_progress = bool(pending_send_bytes)
-                if disable_candidate and now >= disable_allowed_at:
-                    disable_session_automation(session_state)
-                    pending_send_bytes.clear()
-                    pending_submission = None
-                    helper_send_in_progress = False
-                    if not disable_notice_shown:
-                        os.write(
-                            sys.stderr.fileno(),
-                            b"\r\n[codex-auto-continue] switched to manual mode.\r\n",
-                        )
-                        disable_notice_shown = True
-                    debug(f"disabled by user input {data!r}")
-                if helper_send_in_progress:
-                    debug(f"suppressed stdin during scheduled send: {data!r}")
-                    continue
-                try:
-                    write_handle_bytes(input_write, data)
-                except OSError:
-                    stop_loop = True
-                    break
-            if stop_loop:
-                break
-
-            for event in drain_queue_nowait(notify_queue):
-                assert isinstance(event, dict)
-                debug(f"notify event={event!r}")
-                if event.get("type") == "agent-turn-complete":
-                    session_state.turn_in_flight = False
-                    maybe_send_turn_notification(ntfy_config, event, session_state)
-                    maybe_finalize_idle_mode(session_state, ntfy_config)
-
-            if now - last_resize_check >= 0.2:
-                current_size = current_console_size(stdout_handle)
-                if current_size != last_console_size:
-                    resize_pseudo_console(pseudo_console, current_size)
-                    last_console_size = current_size
-                last_resize_check = now
-
-            polled_exit = poll_process_exit(process_info.hProcess)
-            if polled_exit is not None:
-                exit_code = polled_exit
-                if not output_thread.is_alive():
-                    break
-
-            sleep_for = 0.02
-            if pending_send_bytes:
-                sleep_for = min(
-                    sleep_for,
-                    max(0.0, pending_send_bytes[0][0] - time.monotonic()),
-                )
-            if stdin_hotkey_state.pending_escape_deadline is not None:
-                sleep_for = min(
-                    sleep_for,
-                    max(
-                        0.0,
-                        stdin_hotkey_state.pending_escape_deadline
-                        - time.monotonic(),
-                    ),
-                )
-            time.sleep(max(0.0, sleep_for))
-    finally:
-        stop_event.set()
-        close_handle(input_write)
-        try:
-            notify_socket.close()
-        except OSError:
-            pass
-        output_thread.join(timeout=1.0)
-
-    return exit_code if exit_code is not None else wait_for_process_exit(process_info.hProcess)
-
-
 def parse_args() -> tuple[argparse.Namespace, list[str]]:
     parser = argparse.ArgumentParser()
     parser.add_argument("--node", required=True)
@@ -1831,9 +1389,9 @@ def parse_args() -> tuple[argparse.Namespace, list[str]]:
     parser.add_argument("--mode", choices=[AUTO_MODE, CHAT_MODE], default=AUTO_MODE)
     parser.add_argument("--prompt", required=True)
     parser.add_argument("--limit", type=parse_positive_int)
-    parser.add_argument("--ntfy-topic")
-    parser.add_argument("--ntfy-base-url")
-    parser.add_argument("--notify-timeout-ms", type=parse_positive_int)
+    parser.add_argument("--web-bind", required=True)
+    parser.add_argument("--web-port", type=parse_positive_int, required=True)
+    parser.add_argument("--web-password", required=True)
     parser.add_argument("passthrough", nargs=argparse.REMAINDER)
     args = parser.parse_args()
 
@@ -1845,16 +1403,7 @@ def parse_args() -> tuple[argparse.Namespace, list[str]]:
 
 
 def main() -> int:
-    try:
-        args, passthrough = parse_args()
-        args.ntfy_config = build_ntfy_config(args)
-        if args.mode == CHAT_MODE and args.ntfy_config is None:
-            raise ValueError("--mode chat requires --ntfy-topic")
-    except ValueError as error:
-        print(error, file=sys.stderr)
-        return 1
-    if os.name == "nt":
-        return launch_child_windows(args, passthrough)
+    args, passthrough = parse_args()
     return launch_child_unix(args, passthrough)
 
 
