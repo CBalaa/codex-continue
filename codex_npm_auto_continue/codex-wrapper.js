@@ -12,9 +12,11 @@ const __dirname = path.dirname(__filename);
 
 const REAL_LAUNCHER = path.join(__dirname, "codex.real.js");
 const PTY_HELPER = path.join(__dirname, "codex-auto-continue-pty.py");
+const WEB_SERVER = path.join(__dirname, "codex-auto-continue-web-server.py");
 const WRAPPER_AUTO_FLAG = "--auto-mode";
 const WRAPPER_CHAT_FLAG = "--chat-mode";
 const WRAPPER_NATIVE_FLAG = "--native";
+const WRAPPER_WEB_CONSOLE_FLAG = "--web-console";
 const REMOVED_WRAPPER_AUTO_FLAG = "--auto-continue";
 const REMOVED_WRAPPER_NO_AUTO_FLAG = "--no-auto-continue";
 const WRAPPER_PROMPT_FLAG = "--auto-continue-prompt";
@@ -246,6 +248,7 @@ function resolveWebSettings(parsed) {
 function parseWrapperArgs(argv) {
   const passthrough = [];
   let launchMode = null;
+  let launchConsole = false;
   let autoPrompt = "继续";
   let autoLimit = null;
 
@@ -258,6 +261,14 @@ function parseWrapperArgs(argv) {
 
   for (let index = 0; index < argv.length; index += 1) {
     const arg = argv[index];
+
+    if (arg === WRAPPER_WEB_CONSOLE_FLAG) {
+      if (launchConsole || launchMode !== null) {
+        throw new Error(`${WRAPPER_WEB_CONSOLE_FLAG} cannot be combined with another launch mode flag.`);
+      }
+      launchConsole = true;
+      continue;
+    }
 
     if (arg === WRAPPER_AUTO_FLAG) {
       setLaunchMode("auto", WRAPPER_AUTO_FLAG);
@@ -321,6 +332,7 @@ function parseWrapperArgs(argv) {
 
   return {
     launchMode,
+    launchConsole,
     autoLimit,
     autoPrompt,
     passthrough,
@@ -424,6 +436,68 @@ async function main() {
     process.exit(1);
   }
 
+  if (parsed.launchConsole) {
+    let webSettings;
+    try {
+      webSettings = resolveWebSettings(parsed);
+    } catch (error) {
+      console.error(`[codex-auto-continue] ${error.message}`);
+      process.exit(1);
+    }
+
+    if (webSettings.webPassword === null) {
+      const detail =
+        webSettings.configExists === false
+          ? `${webSettings.configPath} was not found`
+          : `no web password is configured in ${webSettings.configPath}`;
+      console.error(
+        `[codex-auto-continue] ${detail}; add "# codex-remote-web-password = \\\"change-me\\\"" to enable the private web console.`,
+      );
+      process.exit(1);
+    }
+
+    if (!existsSync(WEB_SERVER)) {
+      console.error(`[codex-auto-continue] missing manager ${WEB_SERVER}.`);
+      process.exit(1);
+    }
+
+    const python = findPython();
+    if (!python) {
+      console.error(
+        "[codex-auto-continue] web console mode requires python3, python, or PYTHON on PATH.",
+      );
+      process.exit(1);
+    }
+
+    console.error(
+      `[codex-auto-continue] starting private web console at ${JSON.stringify(
+        formatWebUrl(webSettings.webBind, webSettings.webPort),
+      )} from ${webSettings.configPath}.`,
+    );
+    console.error(
+      '[codex-auto-continue] open the web console and use "新建标签页" to start background Codex sessions.',
+    );
+
+    const [pythonCommand, ...pythonArgs] = python;
+    await spawnAndMirror(pythonCommand, [
+      ...pythonArgs,
+      WEB_SERVER,
+      "--bind",
+      webSettings.webBind,
+      "--port",
+      String(webSettings.webPort),
+      "--password",
+      webSettings.webPassword,
+      "--node",
+      process.execPath,
+      "--launcher",
+      REAL_LAUNCHER,
+      "--",
+      ...parsed.passthrough,
+    ]);
+    return;
+  }
+
   const eligibleForAutoContinue = shouldOfferAutoContinue(parsed.passthrough);
   if (!eligibleForAutoContinue) {
     await spawnAndMirror(process.execPath, [REAL_LAUNCHER, ...parsed.passthrough]);
@@ -509,7 +583,7 @@ async function main() {
     )} from ${webSettings.configPath}.`,
   );
   console.error(
-    "[codex-auto-continue] the helper will print a startup control key; add a new tab with that key after login.",
+    "[codex-auto-continue] this session will appear as a tab automatically after the web console connects.",
   );
 
   const [pythonCommand, ...pythonArgs] = python;

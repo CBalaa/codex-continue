@@ -8,9 +8,9 @@ const listenUrl = document.getElementById("listenUrl");
 const activeTabBadge = document.getElementById("activeTabBadge");
 const streamState = document.getElementById("streamState");
 const tabList = document.getElementById("tabList");
-const attachForm = document.getElementById("attachForm");
-const attachKeyInput = document.getElementById("attachKeyInput");
-const attachError = document.getElementById("attachError");
+const createForm = document.getElementById("createForm");
+const createTabButton = document.getElementById("createTabButton");
+const createError = document.getElementById("createError");
 const emptyConsoleState = document.getElementById("emptyConsoleState");
 const instancePanels = document.getElementById("instancePanels");
 const statusPill = document.getElementById("statusPill");
@@ -53,6 +53,26 @@ function eventKindLabel(kind) {
   return "状态";
 }
 
+function lifecycleLabel(instance) {
+  const state = instance?.lifecycle_state;
+  if (state === "starting") return "启动中";
+  if (state === "stopping") return "停止中";
+  if (state === "failed") return "失败";
+  if (state === "exited") return "已退出";
+  if (instance?.connected) return modeLabel(instance.mode);
+  return "离线";
+}
+
+function instanceVisualState(instance) {
+  if (!instance) return "offline";
+  if (instance.lifecycle_state === "starting") return "starting";
+  if (instance.lifecycle_state === "stopping") return "stopping";
+  if (instance.lifecycle_state === "failed") return "failed";
+  if (instance.lifecycle_state === "exited") return "offline";
+  if (!instance.connected) return "offline";
+  return instance.status === "executing" || instance.turn_in_flight ? "running" : "idle";
+}
+
 function request(path, options = {}) {
   return fetch(path, {
     credentials: "same-origin",
@@ -64,22 +84,22 @@ function request(path, options = {}) {
   });
 }
 
-function attachedInstances() {
-  return snapshot?.attached_instances || [];
+function instances() {
+  return snapshot?.instances || snapshot?.attached_instances || [];
 }
 
 function selectedInstance() {
-  return attachedInstances().find((item) => item.instance_id === activeInstanceId) || null;
+  return instances().find((item) => item.instance_id === activeInstanceId) || null;
 }
 
 function selectFallbackInstance() {
-  const instances = attachedInstances();
-  if (!instances.length) {
+  const currentInstances = instances();
+  if (!currentInstances.length) {
     activeInstanceId = null;
     return;
   }
   if (!selectedInstance()) {
-    activeInstanceId = instances[0].instance_id;
+    activeInstanceId = currentInstances[0].instance_id;
   }
 }
 
@@ -87,13 +107,24 @@ function applySnapshot(nextSnapshot) {
   snapshot = nextSnapshot;
   listenUrl.textContent = nextSnapshot.listen_url || window.location.origin;
   selectFallbackInstance();
+  renderCreateAvailability();
   renderTabs();
   renderSelectedInstance();
 }
 
+function renderCreateAvailability() {
+  const enabled = snapshot?.can_create_instances !== false;
+  createTabButton.disabled = !enabled;
+  if (!enabled) {
+    createError.textContent = "当前 manager 没有可用的启动器配置，无法新建 Codex 实例";
+  } else if (createError.textContent.startsWith("当前 manager")) {
+    createError.textContent = "";
+  }
+}
+
 function renderTabs() {
-  const instances = attachedInstances();
-  if (!instances.length) {
+  const currentInstances = instances();
+  if (!currentInstances.length) {
     tabList.textContent = "暂无已连接标签页";
     tabList.className = "tab-list empty-state";
     return;
@@ -101,7 +132,7 @@ function renderTabs() {
 
   tabList.className = "tab-list";
   tabList.replaceChildren(
-    ...instances.map((instance) => {
+    ...currentInstances.map((instance) => {
       const item = document.createElement("div");
       item.className = `tab-item ${instance.instance_id === activeInstanceId ? "active" : ""}`;
 
@@ -115,15 +146,15 @@ function renderTabs() {
       });
 
       const statusDot = document.createElement("span");
-      statusDot.className = `tab-status ${instance.connected ? (instance.turn_in_flight ? "running" : "idle") : "offline"}`;
+      statusDot.className = `tab-status ${instanceVisualState(instance)}`;
 
       const label = document.createElement("span");
       label.className = "tab-label";
-      label.textContent = instance.display_name || `Codex ${instance.control_key_hint || "--"}`;
+      label.textContent = instance.display_name || "Codex";
 
       const meta = document.createElement("span");
       meta.className = "tab-meta";
-      meta.textContent = instance.connected ? modeLabel(instance.mode) : "offline";
+      meta.textContent = lifecycleLabel(instance);
 
       selectButton.append(statusDot, label, meta);
 
@@ -131,11 +162,11 @@ function renderTabs() {
       closeButton.type = "button";
       closeButton.className = "tab-close";
       closeButton.textContent = "×";
-      closeButton.title = "关闭标签页";
+      closeButton.title = instance.spawned_by_server ? "关闭实例" : "从网页中移除";
       closeButton.addEventListener("click", async (event) => {
         event.stopPropagation();
         try {
-          await detachInstance(instance.instance_id);
+          await terminateInstance(instance.instance_id);
         } catch (error) {
           showCommandError(error);
         }
@@ -145,6 +176,37 @@ function renderTabs() {
       return item;
     }),
   );
+}
+
+function renderStatus(instance) {
+  const state = instanceVisualState(instance);
+  if (state === "running") {
+    statusPill.textContent = "执行中";
+    statusPill.className = "pill running";
+    return;
+  }
+  if (state === "idle") {
+    statusPill.textContent = "空闲";
+    statusPill.className = "pill idle";
+    return;
+  }
+  if (state === "starting") {
+    statusPill.textContent = "启动中";
+    statusPill.className = "pill starting";
+    return;
+  }
+  if (state === "stopping") {
+    statusPill.textContent = "停止中";
+    statusPill.className = "pill stopping";
+    return;
+  }
+  if (state === "failed") {
+    statusPill.textContent = "失败";
+    statusPill.className = "pill offline";
+    return;
+  }
+  statusPill.textContent = "离线";
+  statusPill.className = "pill offline";
 }
 
 function renderSelectedInstance() {
@@ -161,28 +223,31 @@ function renderSelectedInstance() {
   }
 
   activeTabBadge.hidden = false;
-  activeTabBadge.textContent = instance.display_name || `Codex ${instance.control_key_hint || "--"}`;
-
-  if (!instance.connected) {
-    statusPill.textContent = "离线";
-    statusPill.className = "pill offline";
-  } else {
-    const isRunning = instance.status === "executing" || instance.turn_in_flight;
-    statusPill.textContent = isRunning ? "执行中" : "空闲";
-    statusPill.className = `pill ${isRunning ? "running" : "idle"}`;
-  }
+  activeTabBadge.textContent = instance.display_name || "Codex";
+  renderStatus(instance);
 
   modeValue.textContent = modeLabel(instance.mode);
   chatQueueValue.textContent = countLabel(instance.queued_chat_messages);
   autoTotalValue.textContent = countLabel(instance.remaining_total);
   currentTaskRemainingValue.textContent = countLabel(instance.current_task_remaining);
-  instanceMeta.textContent = instance.connected
-    ? `最后心跳 ${instance.last_seen || "--"}`
-    : `实例已离线，最后心跳 ${instance.last_seen || "--"}`;
+
+  const metaParts = [];
+  if (instance.pid) {
+    metaParts.push(`PID ${instance.pid}`);
+  }
+  metaParts.push(
+    instance.connected
+      ? `最后心跳 ${instance.last_seen || "--"}`
+      : `${lifecycleLabel(instance)} · ${instance.last_seen || "--"}`
+  );
+  instanceMeta.textContent = metaParts.join(" · ");
 
   if (instance.current_task_message) {
     currentTaskMessage.textContent = instance.current_task_message;
     currentTaskMessage.classList.remove("empty");
+  } else if (instance.lifecycle_state === "starting") {
+    currentTaskMessage.textContent = "Codex 正在启动，等待首轮状态上报";
+    currentTaskMessage.classList.add("empty");
   } else {
     currentTaskMessage.textContent = "暂无 auto 任务";
     currentTaskMessage.classList.add("empty");
@@ -192,16 +257,29 @@ function renderSelectedInstance() {
   if (assistant) {
     latestReply.textContent = assistant;
     latestReply.classList.remove("empty");
+  } else if (instance.launch_error) {
+    latestReply.textContent = instance.launch_error;
+    latestReply.classList.remove("empty");
   } else {
     latestReply.textContent = "暂无回复";
     latestReply.classList.add("empty");
   }
 
-  renderEvents(instance.recent_events || []);
+  renderEvents(instance);
   updateCommandAvailability(instance);
 }
 
-function renderEvents(events) {
+function renderEvents(instance) {
+  const events = [...(instance.recent_events || [])];
+  if (instance.launch_error) {
+    events.unshift({
+      kind: "control-error",
+      timestamp: instance.last_seen || "",
+      title: "实例错误",
+      text: instance.launch_error,
+    });
+  }
+
   if (!events.length) {
     recentEvents.textContent = "暂无事件";
     recentEvents.className = "event-list empty-state";
@@ -232,7 +310,8 @@ function renderEvents(events) {
 
       const body = document.createElement("pre");
       body.className = "event-body";
-      body.textContent = entry.kind === "assistant" && entry.assistant ? entry.assistant : entry.text || "";
+      body.textContent =
+        entry.kind === "assistant" && entry.assistant ? entry.assistant : entry.text || "";
 
       item.append(meta, title, body);
       return item;
@@ -269,7 +348,7 @@ function setLoggedOut() {
   activeTabBadge.hidden = true;
   activeTabBadge.textContent = "未选择标签页";
   streamState.textContent = "未连接";
-  attachError.textContent = "";
+  createError.textContent = "";
 }
 
 async function loadState() {
@@ -333,14 +412,14 @@ async function submitCommand(payload) {
   }
 }
 
-async function detachInstance(instanceId) {
-  const response = await request("/api/detach", {
+async function terminateInstance(instanceId) {
+  const response = await request("/api/terminate", {
     method: "POST",
     body: JSON.stringify({ instance_id: instanceId }),
   });
   const data = await response.json().catch(() => ({}));
   if (!response.ok) {
-    throw new Error(data.error || "关闭标签页失败");
+    throw new Error(data.error || "关闭实例失败");
   }
   if (activeInstanceId === instanceId) {
     activeInstanceId = null;
@@ -382,26 +461,20 @@ logoutButton.addEventListener("click", async () => {
   setLoggedOut();
 });
 
-attachForm.addEventListener("submit", async (event) => {
+createForm.addEventListener("submit", async (event) => {
   event.preventDefault();
-  attachError.textContent = "";
-  const controlKey = attachKeyInput.value.trim();
-  if (!controlKey) {
-    attachError.textContent = "请输入 control key";
-    return;
-  }
+  createError.textContent = "";
 
-  const response = await request("/api/attach", {
+  const response = await request("/api/instances", {
     method: "POST",
-    body: JSON.stringify({ control_key: controlKey }),
+    body: JSON.stringify({}),
   });
   const data = await response.json().catch(() => ({}));
   if (!response.ok) {
-    attachError.textContent = data.error || "绑定标签页失败";
+    createError.textContent = data.error || "新建标签页失败";
     return;
   }
 
-  attachKeyInput.value = "";
   activeInstanceId = data.instance_id || activeInstanceId;
   applySnapshot(data.snapshot);
 });

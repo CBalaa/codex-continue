@@ -25,7 +25,7 @@
       <section class="panel auth-panel" id="authPanel">
         <div class="panel-head">
           <h2>登录</h2>
-          <p>先用控制台密码登录。实例 key 在登录后新增标签页时输入。</p>
+          <p>先用控制台密码登录。登录后可以直接新建和管理多个 Codex 标签页。</p>
         </div>
         <form id="loginForm" class="stack-form">
           <label>
@@ -42,26 +42,22 @@
           <div class="panel-head compact">
             <div>
               <h2>Codex 标签页</h2>
-              <p class="minor">点击标签页切换实例，新建标签页时输入启动后打印的 control key。</p>
+              <p class="minor">点击标签页切换实例；新建标签页会直接启动一个新的后台 Codex 会话。</p>
             </div>
             <span class="minor" id="streamState">实时连接中</span>
           </div>
 
           <div id="tabList" class="tab-list empty-state">暂无已连接标签页</div>
 
-          <form id="attachForm" class="attach-form">
-            <label class="attach-input">
-              <span>新标签页 Key</span>
-              <input id="attachKeyInput" type="text" name="control_key" autocomplete="off" spellcheck="false" placeholder="输入某个 Codex 启动后打印的 key">
-            </label>
-            <button type="submit">新建标签页</button>
+          <form id="createForm" class="attach-form">
+            <button id="createTabButton" type="submit">新建标签页</button>
           </form>
-          <p class="error" id="attachError"></p>
+          <p class="error" id="createError"></p>
         </article>
 
         <section class="panel empty-console" id="emptyConsoleState">
           <h2>还没有选中的 Codex 标签页</h2>
-          <p>先在上面输入一个运行中实例的 control key，绑定后就能像原来一样发 chat / auto 控制命令。</p>
+          <p>先在上面新建一个标签页，或等待已运行的实例自动出现在这里。</p>
         </section>
 
         <section id="instancePanels" hidden>

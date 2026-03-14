@@ -11,6 +11,7 @@ import queue
 import secrets
 import shutil
 import socket
+import struct
 import subprocess
 import sys
 import tempfile
@@ -47,6 +48,10 @@ QUEUE_KEY = b"\t"
 CTRL_C = 3
 ESC = 27
 LOCALHOST = "127.0.0.1"
+DEFAULT_HEADLESS_COLUMNS = 120
+DEFAULT_HEADLESS_ROWS = 40
+HEADLESS_STARTUP_SEND_GUARD_SECONDS = 8.0
+HEADLESS_STARTUP_QUIET_SECONDS = 0.5
 MANUAL_MODE = "manual"
 AUTO_MODE = "auto"
 CHAT_MODE = "chat"
@@ -107,20 +112,26 @@ class RemoteConsoleClient:
         bind: str,
         port: int,
         password: str,
-        control_key: str,
+        node_bin: str,
+        launcher_path: str,
+        child_passthrough: list[str],
         control_queue: queue.Queue,
         stop_event: threading.Event,
+        instance_id: Optional[str] = None,
+        allow_server_start: bool = True,
     ):
         self.bind = bind
         self.port = port
         self.password = password
-        self.control_key = control_key
-        self.control_key_hint = mask_secret(control_key)
+        self.node_bin = node_bin
+        self.launcher_path = launcher_path
+        self.child_passthrough = list(child_passthrough)
         self.control_queue = control_queue
         self.stop_event = stop_event
+        self.allow_server_start = allow_server_start
         self.listen_url = build_listen_url(bind, port)
         self.base_url = self.listen_url.rstrip("/")
-        self.instance_id = secrets.token_urlsafe(18)
+        self.instance_id = instance_id or secrets.token_urlsafe(18)
         self._lock = threading.Lock()
         self._runtime: dict[str, object] = {
             "mode": MANUAL_MODE,
@@ -249,7 +260,6 @@ class RemoteConsoleClient:
     def _build_snapshot_locked(self) -> dict[str, object]:
         return {
             **copy.deepcopy(self._runtime),
-            "control_key_hint": self.control_key_hint,
             "recent_events": list(copy.deepcopy(self._recent_events)),
             "latest_assistant": copy.deepcopy(self._latest_assistant),
             "latest_control": copy.deepcopy(self._latest_control),
@@ -263,6 +273,10 @@ class RemoteConsoleClient:
         try:
             self._post_json("/internal/update", payload)
         except Exception as error:
+            if not self.allow_server_start:
+                debug(f"snapshot update failed against managed server: {error}")
+                self.stop_event.set()
+                return
             debug(f"snapshot update failed, retrying after server recovery: {error}")
             self._recover_server()
             self._post_json("/internal/update", payload)
@@ -274,8 +288,6 @@ class RemoteConsoleClient:
             "/internal/register",
             {
                 "instance_id": self.instance_id,
-                "control_key": self.control_key,
-                "control_key_hint": self.control_key_hint,
                 "snapshot": snapshot,
             },
         )
@@ -319,6 +331,10 @@ class RemoteConsoleClient:
             except Exception as error:
                 if self.stop_event.is_set():
                     return
+                if not self.allow_server_start:
+                    debug(f"managed control poll failed without recovery: {error}")
+                    self.stop_event.set()
+                    return
                 debug(f"control poll failed, retrying after recovery: {error}")
                 time.sleep(0.5)
                 try:
@@ -330,23 +346,34 @@ class RemoteConsoleClient:
     def _ensure_server_running(self) -> None:
         if self._healthcheck():
             return
+        if not self.allow_server_start:
+            raise RuntimeError(
+                f"managed web console server is not reachable at {self.listen_url}"
+            )
 
         server_path = Path(__file__).with_name(SERVER_SCRIPT)
-        python_argv = [*current_python_argv(), str(server_path)]
+        python_argv = [
+            *current_python_argv(),
+            str(server_path),
+            "--bind",
+            self.bind,
+            "--port",
+            str(self.port),
+            "--password",
+            self.password,
+            "--node",
+            self.node_bin,
+            "--launcher",
+            self.launcher_path,
+            "--",
+            *self.child_passthrough,
+        ]
         debug(
             "starting remote console server at "
             f"{self.listen_url} with script={server_path}"
         )
         server_process = subprocess.Popen(
-            [
-                *python_argv,
-                "--bind",
-                self.bind,
-                "--port",
-                str(self.port),
-                "--password",
-                self.password,
-            ],
+            python_argv,
             stdin=subprocess.DEVNULL,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
@@ -1342,6 +1369,19 @@ def schedule_submission(
     return scheduled, schedule_send(scheduled.message)
 
 
+def startup_send_ready(
+    now: float,
+    interactive_tty: bool,
+    send_allowed_at: float,
+    last_master_output_at: float,
+) -> bool:
+    if interactive_tty:
+        return True
+    if now < send_allowed_at:
+        return False
+    return (now - last_master_output_at) >= HEADLESS_STARTUP_QUIET_SECONDS
+
+
 def disable_session_automation(state: SessionState) -> None:
     state.mode = MANUAL_MODE
     state.auto_tasks.clear()
@@ -1388,22 +1428,44 @@ def copy_winsize_unix(source_fd: int, target_fd: int) -> None:
         pass
 
 
+def set_winsize_unix(
+    target_fd: int,
+    rows: int,
+    cols: int,
+    x_pixels: int = 0,
+    y_pixels: int = 0,
+) -> None:
+    try:
+        packed = struct.pack("HHHH", rows, cols, x_pixels, y_pixels)
+        fcntl.ioctl(target_fd, termios.TIOCSWINSZ, packed)
+    except OSError:
+        pass
+
+
 def start_remote_console_client(
     bind: str,
     port: int,
     password: str,
-    control_key: str,
+    node_bin: str,
+    launcher_path: str,
+    child_passthrough: list[str],
     control_queue: queue.Queue,
     stop_event: threading.Event,
     initial_state: SessionState,
+    instance_id: Optional[str] = None,
+    allow_server_start: bool = True,
 ) -> RemoteConsoleClient:
     client = RemoteConsoleClient(
         bind,
         port,
         password,
-        control_key,
+        node_bin,
+        launcher_path,
+        child_passthrough,
         control_queue,
         stop_event,
+        instance_id=instance_id,
+        allow_server_start=allow_server_start,
     )
     client.start(initial_state)
     return client
@@ -1414,6 +1476,7 @@ def launch_child_unix(args: argparse.Namespace, passthrough: list[str]) -> int:
     notify_socket, host, port = create_notify_socket()
     notify_socket.setblocking(False)
     child_env = os.environ.copy()
+    parent_has_tty = os.isatty(sys.stdin.fileno()) and os.isatty(sys.stdout.fileno())
     child_argv = build_child_argv(
         args.node,
         args.launcher,
@@ -1425,7 +1488,12 @@ def launch_child_unix(args: argparse.Namespace, passthrough: list[str]) -> int:
 
     child_pid, master_fd = pty.fork()
     if child_pid == 0:
+        if not parent_has_tty:
+            set_winsize_unix(0, DEFAULT_HEADLESS_ROWS, DEFAULT_HEADLESS_COLUMNS)
         os.execvpe(args.node, child_argv, child_env)
+
+    if not parent_has_tty:
+        set_winsize_unix(master_fd, DEFAULT_HEADLESS_ROWS, DEFAULT_HEADLESS_COLUMNS)
 
     try:
         return forward_loop_unix(
@@ -1438,6 +1506,10 @@ def launch_child_unix(args: argparse.Namespace, passthrough: list[str]) -> int:
             args.web_bind,
             args.web_port,
             args.web_password,
+            args.node,
+            args.launcher,
+            passthrough,
+            args.instance_id,
         )
     finally:
         try:
@@ -1457,11 +1529,23 @@ def forward_loop_unix(
     web_bind: str,
     web_port: int,
     web_password: str,
+    node_bin: str,
+    launcher_path: str,
+    child_passthrough: list[str],
+    instance_id: Optional[str],
 ) -> int:
-    stdin_fd = sys.stdin.fileno()
     stdout_fd = sys.stdout.fileno()
     stderr_fd = sys.stderr.fileno()
-    old_tty_settings = termios.tcgetattr(stdin_fd)
+    stdin_fd = sys.stdin.fileno()
+    interactive_tty = os.isatty(stdin_fd) and os.isatty(stdout_fd)
+    old_tty_settings = termios.tcgetattr(stdin_fd) if interactive_tty else None
+    startup_monotonic = time.monotonic()
+    send_allowed_at = (
+        startup_monotonic
+        if interactive_tty
+        else startup_monotonic + HEADLESS_STARTUP_SEND_GUARD_SECONDS
+    )
+    last_master_output_at = startup_monotonic
     session_state = build_initial_session_state(mode, prompt, limit)
     pending_send_bytes: list[tuple[float, bytes]] = []
     pending_submission: Optional[ScheduledSend] = None
@@ -1469,17 +1553,22 @@ def forward_loop_unix(
     stdin_hotkey_state = StdinHotkeyState()
     disable_allowed_at = time.monotonic() + DISABLE_GUARD_SECONDS
     stop_event = threading.Event()
+    shutdown_requested = threading.Event()
     control_queue: queue.Queue = queue.Queue()
-    control_key = secrets.token_urlsafe(18)
+    managed_by_server = instance_id is not None
     try:
         hub = start_remote_console_client(
             web_bind,
             web_port,
             web_password,
-            control_key,
+            node_bin,
+            launcher_path,
+            child_passthrough,
             control_queue,
             stop_event,
             session_state,
+            instance_id=instance_id,
+            allow_server_start=not managed_by_server,
         )
     except Exception as error:
         os.write(
@@ -1499,59 +1588,61 @@ def forward_loop_unix(
             pass
         return 1
 
-    os.write(
-        stderr_fd,
-        (
-            "[codex-auto-continue] control key for this Codex: "
-            f"{control_key}\r\n"
-        ).encode("utf-8"),
-    )
-    os.write(
-        stderr_fd,
-        b"[codex-auto-continue] log in to the shared web console, then add a tab with this key.\r\n",
-    )
+    previous_sigwinch = None
+    previous_sigterm = signal.getsignal(signal.SIGTERM)
+    previous_sigint = signal.getsignal(signal.SIGINT)
+    previous_sighup = signal.getsignal(signal.SIGHUP)
 
-    tty.setraw(stdin_fd)
-    try:
-        termios.tcflush(stdin_fd, termios.TCIFLUSH)
-        debug("flushed pending stdin after launch-mode prompt")
-    except termios.error as error:
-        debug(f"stdin flush failed: {error}")
-    copy_winsize_unix(stdin_fd, master_fd)
+    def request_shutdown(_signum, _frame) -> None:
+        shutdown_requested.set()
 
-    def on_sigwinch(_signum, _frame) -> None:
+    signal.signal(signal.SIGTERM, request_shutdown)
+    signal.signal(signal.SIGINT, request_shutdown)
+    signal.signal(signal.SIGHUP, request_shutdown)
+
+    if interactive_tty:
+        tty.setraw(stdin_fd)
+        try:
+            termios.tcflush(stdin_fd, termios.TCIFLUSH)
+            debug("flushed pending stdin after launch-mode prompt")
+        except termios.error as error:
+            debug(f"stdin flush failed: {error}")
         copy_winsize_unix(stdin_fd, master_fd)
 
-    previous_sigwinch = signal.getsignal(signal.SIGWINCH)
-    signal.signal(signal.SIGWINCH, on_sigwinch)
+        def on_sigwinch(_signum, _frame) -> None:
+            copy_winsize_unix(stdin_fd, master_fd)
+
+        previous_sigwinch = signal.getsignal(signal.SIGWINCH)
+        signal.signal(signal.SIGWINCH, on_sigwinch)
     disable_notice_shown = False
 
     try:
-        while True:
+        while not shutdown_requested.is_set() and not stop_event.is_set():
             now = time.monotonic()
-            hotkey_bytes, disable_candidate = flush_pending_stdin_hotkey(
-                stdin_hotkey_state, now
-            )
-            if hotkey_bytes:
-                debug(f"stdin hotkey flush bytes={hotkey_bytes!r}")
-                if disable_candidate and now >= disable_allowed_at:
-                    disable_session_automation(session_state)
-                    pending_send_bytes.clear()
-                    pending_submission = None
-                    active_turn_source = None
-                    hub.publish_system_event(
-                        session_state,
-                        "Manual mode",
-                        "switched to manual mode from local keyboard",
-                    )
-                    if not disable_notice_shown:
-                        os.write(
-                            stderr_fd,
-                            b"\r\n[codex-auto-continue] switched to manual mode.\r\n",
+            if interactive_tty:
+                hotkey_bytes, disable_candidate = flush_pending_stdin_hotkey(
+                    stdin_hotkey_state, now
+                )
+                if hotkey_bytes:
+                    debug(f"stdin hotkey flush bytes={hotkey_bytes!r}")
+                    if disable_candidate and now >= disable_allowed_at:
+                        disable_session_automation(session_state)
+                        pending_send_bytes.clear()
+                        pending_submission = None
+                        active_turn_source = None
+                        hub.publish_system_event(
+                            session_state,
+                            "Manual mode",
+                            "switched to manual mode from local keyboard",
                         )
-                        disable_notice_shown = True
-                    debug(f"disabled by buffered stdin hotkey {hotkey_bytes!r}")
-                os.write(master_fd, hotkey_bytes)
+                        if not disable_notice_shown:
+                            os.write(
+                                stderr_fd,
+                                b"\r\n[codex-auto-continue] switched to manual mode.\r\n",
+                            )
+                            disable_notice_shown = True
+                        debug(f"disabled by buffered stdin hotkey {hotkey_bytes!r}")
+                    os.write(master_fd, hotkey_bytes)
 
             for control_event in drain_queue_nowait(control_queue):
                 assert isinstance(control_event, QueuedControlCommand)
@@ -1567,11 +1658,17 @@ def forward_loop_unix(
                     debug("cleared pending scheduled send after control update")
 
             maybe_finalize_idle_mode(session_state, hub)
-            pending_submission, new_send_bytes = schedule_submission(
-                session_state, pending_submission
-            )
-            if new_send_bytes:
-                pending_send_bytes = new_send_bytes
+            if startup_send_ready(
+                now,
+                interactive_tty,
+                send_allowed_at,
+                last_master_output_at,
+            ):
+                pending_submission, new_send_bytes = schedule_submission(
+                    session_state, pending_submission
+                )
+                if new_send_bytes:
+                    pending_send_bytes = new_send_bytes
 
             if pending_send_bytes and now >= pending_send_bytes[0][0]:
                 _, chunk = pending_send_bytes.pop(0)
@@ -1593,7 +1690,7 @@ def forward_loop_unix(
             timeout = None
             if pending_send_bytes:
                 timeout = max(0.0, pending_send_bytes[0][0] - now)
-            if stdin_hotkey_state.pending_escape_deadline is not None:
+            if interactive_tty and stdin_hotkey_state.pending_escape_deadline is not None:
                 hotkey_timeout = max(
                     0.0, stdin_hotkey_state.pending_escape_deadline - now
                 )
@@ -1604,8 +1701,13 @@ def forward_loop_unix(
                 else min(timeout, CONTROL_POLL_INTERVAL_SECONDS)
             )
 
-            read_fds = [master_fd, notify_socket.fileno(), stdin_fd]
-            ready, _, _ = select.select(read_fds, [], [], timeout)
+            read_fds = [master_fd, notify_socket.fileno()]
+            if interactive_tty:
+                read_fds.append(stdin_fd)
+            try:
+                ready, _, _ = select.select(read_fds, [], [], timeout)
+            except InterruptedError:
+                continue
 
             if master_fd in ready:
                 try:
@@ -1614,9 +1716,10 @@ def forward_loop_unix(
                     break
                 if not data:
                     break
+                last_master_output_at = time.monotonic()
                 os.write(stdout_fd, data)
 
-            if stdin_fd in ready:
+            if interactive_tty and stdin_fd in ready:
                 data = os.read(stdin_fd, 1024)
                 if not data:
                     continue
@@ -1679,16 +1782,67 @@ def forward_loop_unix(
                     hub.publish_runtime(session_state)
     finally:
         stop_event.set()
-        signal.signal(signal.SIGWINCH, previous_sigwinch)
-        termios.tcsetattr(stdin_fd, termios.TCSADRAIN, old_tty_settings)
+        if shutdown_requested.is_set() or managed_by_server:
+            terminate_child_process(child_pid)
+        signal.signal(signal.SIGTERM, previous_sigterm)
+        signal.signal(signal.SIGINT, previous_sigint)
+        signal.signal(signal.SIGHUP, previous_sighup)
+        if interactive_tty and previous_sigwinch is not None and old_tty_settings is not None:
+            signal.signal(signal.SIGWINCH, previous_sigwinch)
+            termios.tcsetattr(stdin_fd, termios.TCSADRAIN, old_tty_settings)
         hub.close()
 
-    _, status = os.waitpid(child_pid, 0)
+    status = wait_for_child_exit(
+        child_pid,
+        shutdown_requested.is_set() or managed_by_server,
+    )
     if os.WIFSIGNALED(status):
         return 128 + os.WTERMSIG(status)
     if os.WIFEXITED(status):
         return os.WEXITSTATUS(status)
     return 1
+
+
+def terminate_child_process(child_pid: int) -> None:
+    try:
+        os.killpg(child_pid, signal.SIGTERM)
+        return
+    except OSError:
+        pass
+    try:
+        os.kill(child_pid, signal.SIGTERM)
+    except OSError:
+        pass
+
+
+def wait_for_child_exit(child_pid: int, force_terminate: bool) -> int:
+    if not force_terminate:
+        _, status = os.waitpid(child_pid, 0)
+        return status
+
+    deadline = time.monotonic() + 5.0
+    while time.monotonic() < deadline:
+        try:
+            waited_pid, status = os.waitpid(child_pid, os.WNOHANG)
+        except ChildProcessError:
+            return 0
+        if waited_pid == child_pid:
+            return status
+        time.sleep(0.1)
+
+    try:
+        os.killpg(child_pid, signal.SIGKILL)
+    except OSError:
+        try:
+            os.kill(child_pid, signal.SIGKILL)
+        except OSError:
+            pass
+
+    try:
+        _, status = os.waitpid(child_pid, 0)
+    except ChildProcessError:
+        return 0
+    return status
 
 
 def drain_queue_nowait(items: queue.Queue) -> list[object]:
@@ -1710,6 +1864,7 @@ def parse_args() -> tuple[argparse.Namespace, list[str]]:
     parser.add_argument("--web-bind", required=True)
     parser.add_argument("--web-port", type=parse_positive_int, required=True)
     parser.add_argument("--web-password", required=True)
+    parser.add_argument("--instance-id")
     parser.add_argument("passthrough", nargs=argparse.REMAINDER)
     args = parser.parse_args()
 

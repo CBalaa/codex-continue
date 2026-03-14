@@ -7,6 +7,9 @@ import copy
 import json
 import queue
 import secrets
+import subprocess
+import sys
+import tempfile
 import threading
 import time
 from dataclasses import dataclass, field
@@ -23,36 +26,59 @@ SSE_KEEPALIVE_SECONDS = 15.0
 MAX_REQUEST_BODY_BYTES = 65536
 MAX_SSE_QUEUE_SIZE = 32
 LOCAL_CLIENTS = {"127.0.0.1", "::1", "::ffff:127.0.0.1"}
+DEFAULT_INSTANCE_PROMPT = "继续"
 
 
 @dataclass
 class SessionRecord:
-    attached_instance_ids: list[str] = field(default_factory=list)
+    created_at: float = field(default_factory=time.time)
 
 
 @dataclass
 class InstanceRecord:
     instance_id: str
-    control_key: Optional[str]
-    control_key_hint: str
+    display_name: str
     snapshot: dict[str, object]
     command_queue: queue.Queue
-    connected: bool = True
+    created_at: float = field(default_factory=time.time)
     last_seen: float = field(default_factory=time.time)
+    connected: bool = False
+    lifecycle_state: str = "starting"
+    hidden: bool = False
+    spawned_by_server: bool = False
+    launch_error: Optional[str] = None
+    exit_code: Optional[int] = None
+    pid: Optional[int] = None
+    process: Optional[subprocess.Popen] = None
+    log_path: Optional[str] = None
 
 
 class ConsoleRegistry:
-    def __init__(self, bind: str, port: int, password: str):
+    def __init__(
+        self,
+        bind: str,
+        port: int,
+        password: str,
+        node: Optional[str],
+        launcher: Optional[str],
+        child_passthrough: list[str],
+    ):
         self.bind = bind
         self.port = port
         self.password = password
+        self.node = node
+        self.launcher = launcher
+        self.child_passthrough = list(child_passthrough)
         self.listen_url = build_listen_url(bind, port)
+        self.static_dir = Path(__file__).resolve().parent
+        self.helper_path = self.static_dir / "codex-auto-continue-pty.py"
+        self.python_argv = current_python_argv()
         self._lock = threading.Lock()
         self._sessions: dict[str, SessionRecord] = {}
         self._instances: dict[str, InstanceRecord] = {}
-        self._control_key_to_instance_id: dict[str, str] = {}
         self._subscribers: dict[int, tuple[str, queue.Queue]] = {}
         self._next_subscriber_id = 1
+        self._next_instance_number = 1
 
     def verify_password(self, candidate: str) -> bool:
         return secrets.compare_digest(candidate, self.password)
@@ -88,7 +114,7 @@ class ConsoleRegistry:
             subscriber_id = self._next_subscriber_id
             self._next_subscriber_id += 1
             self._subscribers[subscriber_id] = (token, subscriber)
-            snapshot = self._build_session_snapshot_locked(token)
+            snapshot = self._build_session_snapshot_locked()
         self._enqueue_snapshot(subscriber, snapshot)
         return subscriber_id, subscriber
 
@@ -98,79 +124,110 @@ class ConsoleRegistry:
 
     def session_snapshot(self, token: str) -> dict[str, object]:
         with self._lock:
-            return self._build_session_snapshot_locked(token)
-
-    def attach_instance(self, token: str, control_key: str) -> tuple[str, dict[str, object]]:
-        with self._lock:
-            session = self._sessions.get(token)
-            if session is None:
+            if token not in self._sessions:
                 raise PermissionError("authentication required")
-            instance_id = self._control_key_to_instance_id.get(control_key)
-            if instance_id is None:
-                raise LookupError("invalid or expired control key")
-            if instance_id not in session.attached_instance_ids:
-                session.attached_instance_ids.append(instance_id)
-            snapshot = self._build_session_snapshot_locked(token)
-        self._broadcast_session(token, snapshot)
+            return self._build_session_snapshot_locked()
+
+    def create_instance(self) -> tuple[str, dict[str, object]]:
+        if self.node is None or self.launcher is None:
+            raise RuntimeError(
+                "instance creation is unavailable because the manager was started without launcher settings"
+            )
+
+        with self._lock:
+            instance_id = secrets.token_urlsafe(18)
+            display_name = self._next_display_name_locked()
+            record = InstanceRecord(
+                instance_id=instance_id,
+                display_name=display_name,
+                snapshot=default_instance_snapshot(),
+                command_queue=queue.Queue(),
+                connected=False,
+                lifecycle_state="starting",
+                spawned_by_server=True,
+            )
+            self._instances[instance_id] = record
+            snapshot = self._build_session_snapshot_locked()
+        self._broadcast_all()
+
+        try:
+            self._spawn_instance(record)
+        except Exception as error:
+            with self._lock:
+                current = self._instances.get(instance_id)
+                if current is not None:
+                    current.connected = False
+                    current.lifecycle_state = "failed"
+                    current.launch_error = str(error)
+                    current.snapshot = default_instance_snapshot()
+                    snapshot = self._build_session_snapshot_locked()
+                else:
+                    snapshot = self._build_session_snapshot_locked()
+            self._broadcast_all()
+            raise
+
         return instance_id, snapshot
 
-    def detach_instance(self, token: str, instance_id: str) -> dict[str, object]:
+    def terminate_instance(self, instance_id: str) -> dict[str, object]:
+        process: Optional[subprocess.Popen] = None
         with self._lock:
-            session = self._sessions.get(token)
-            if session is None:
-                raise PermissionError("authentication required")
-            session.attached_instance_ids = [
-                attached_id
-                for attached_id in session.attached_instance_ids
-                if attached_id != instance_id
-            ]
-            snapshot = self._build_session_snapshot_locked(token)
-        self._broadcast_session(token, snapshot)
+            record = self._instances.get(instance_id)
+            if record is None or record.hidden:
+                raise LookupError("instance not found")
+            process = record.process
+            if process is None:
+                record.hidden = True
+                if not record.connected:
+                    self._instances.pop(instance_id, None)
+            else:
+                record.hidden = True
+                record.lifecycle_state = "stopping"
+                record.connected = False
+            snapshot = self._build_session_snapshot_locked()
+        self._broadcast_all()
+
+        if process is not None and process.poll() is None:
+            self._terminate_helper_process(process)
         return snapshot
 
-    def enqueue_command(
-        self, token: str, instance_id: str, payload: dict[str, object]
-    ) -> None:
+    def shutdown(self) -> None:
         with self._lock:
-            session = self._sessions.get(token)
-            if session is None:
-                raise PermissionError("authentication required")
-            if instance_id not in session.attached_instance_ids:
-                raise PermissionError("instance is not attached in this session")
+            processes = [
+                record.process
+                for record in self._instances.values()
+                if record.spawned_by_server and record.process is not None
+            ]
+        for process in processes:
+            if process is None:
+                continue
+            self._terminate_helper_process(process)
+
+    def enqueue_command(self, instance_id: str, payload: dict[str, object]) -> None:
+        with self._lock:
             record = self._instances.get(instance_id)
-            if record is None:
+            if record is None or record.hidden:
                 raise LookupError("instance not found")
             if not record.connected:
                 raise ConnectionError("instance is offline")
             record.command_queue.put(copy.deepcopy(payload))
 
-    def register_instance(
-        self,
-        instance_id: str,
-        control_key: str,
-        control_key_hint: str,
-        snapshot: dict[str, object],
-    ) -> None:
+    def register_instance(self, instance_id: str, snapshot: dict[str, object]) -> None:
         with self._lock:
             record = self._instances.get(instance_id)
             if record is None:
                 record = InstanceRecord(
                     instance_id=instance_id,
-                    control_key=control_key,
-                    control_key_hint=control_key_hint,
+                    display_name=self._next_display_name_locked(),
                     snapshot=copy.deepcopy(snapshot),
                     command_queue=queue.Queue(),
                 )
                 self._instances[instance_id] = record
-            else:
-                if record.control_key and record.control_key != control_key:
-                    self._control_key_to_instance_id.pop(record.control_key, None)
-                record.control_key = control_key
-                record.control_key_hint = control_key_hint
-                record.snapshot = copy.deepcopy(snapshot)
-                record.connected = True
-                record.last_seen = time.time()
-            self._control_key_to_instance_id[control_key] = instance_id
+            record.snapshot = copy.deepcopy(snapshot)
+            record.connected = True
+            record.hidden = False
+            record.last_seen = time.time()
+            record.lifecycle_state = lifecycle_from_snapshot(snapshot)
+            record.launch_error = None
         self._broadcast_all()
 
     def update_instance(self, instance_id: str, snapshot: dict[str, object]) -> None:
@@ -179,7 +236,10 @@ class ConsoleRegistry:
             if record is None:
                 raise LookupError("instance not registered")
             record.snapshot = copy.deepcopy(snapshot)
+            record.connected = True
             record.last_seen = time.time()
+            record.lifecycle_state = lifecycle_from_snapshot(snapshot)
+            record.launch_error = None
         self._broadcast_all()
 
     def unregister_instance(self, instance_id: str) -> None:
@@ -187,11 +247,11 @@ class ConsoleRegistry:
             record = self._instances.get(instance_id)
             if record is None:
                 return
-            if record.control_key is not None:
-                self._control_key_to_instance_id.pop(record.control_key, None)
-            record.control_key = None
             record.connected = False
             record.last_seen = time.time()
+            record.lifecycle_state = "exited"
+            if record.hidden and record.process is None:
+                self._instances.pop(instance_id, None)
         self._broadcast_all()
 
     def poll_command(
@@ -201,8 +261,8 @@ class ConsoleRegistry:
             record = self._instances.get(instance_id)
             if record is None:
                 raise LookupError("instance not registered")
-            record.last_seen = time.time()
             command_queue = record.command_queue
+            record.last_seen = time.time()
         try:
             command = command_queue.get(timeout=max(0.0, timeout_seconds))
         except queue.Empty:
@@ -213,49 +273,178 @@ class ConsoleRegistry:
                 record.last_seen = time.time()
         return command
 
-    def _build_session_snapshot_locked(self, token: str) -> dict[str, object]:
-        session = self._sessions.get(token)
-        attached_instances: list[dict[str, object]] = []
-        if session is not None:
-            for instance_id in session.attached_instance_ids:
-                record = self._instances.get(instance_id)
-                if record is None:
-                    continue
-                attached_instances.append(self._build_instance_payload_locked(record))
+    def _spawn_instance(self, record: InstanceRecord) -> None:
+        if self.node is None or self.launcher is None:
+            raise RuntimeError("missing launcher settings")
+        if not self.helper_path.exists():
+            raise RuntimeError(f"missing helper: {self.helper_path}")
+
+        log_path = Path(tempfile.gettempdir()) / (
+            f"codex-auto-continue-{record.instance_id}.log"
+        )
+        log_handle = open(log_path, "ab")
+        argv = [
+            *self.python_argv,
+            str(self.helper_path),
+            "--node",
+            self.node,
+            "--launcher",
+            self.launcher,
+            "--mode",
+            "chat",
+            "--prompt",
+            DEFAULT_INSTANCE_PROMPT,
+            "--web-bind",
+            self.bind,
+            "--web-port",
+            str(self.port),
+            "--web-password",
+            self.password,
+            "--instance-id",
+            record.instance_id,
+            "--",
+            *self.child_passthrough,
+        ]
+        try:
+            process = subprocess.Popen(
+                argv,
+                stdin=subprocess.DEVNULL,
+                stdout=log_handle,
+                stderr=subprocess.STDOUT,
+                start_new_session=True,
+                close_fds=True,
+            )
+        except Exception:
+            log_handle.close()
+            raise
+
+        with self._lock:
+            current = self._instances.get(record.instance_id)
+            if current is None:
+                try:
+                    process.terminate()
+                except OSError:
+                    pass
+                log_handle.close()
+                return
+            current.process = process
+            current.pid = process.pid
+            current.log_path = str(log_path)
+
+        watcher = threading.Thread(
+            target=self._wait_for_instance_exit,
+            args=(record.instance_id, process, log_handle),
+            name=f"codex-auto-continue-wait-{record.instance_id}",
+            daemon=True,
+        )
+        watcher.start()
+
+    def _wait_for_instance_exit(
+        self, instance_id: str, process: subprocess.Popen, log_handle
+    ) -> None:
+        try:
+            exit_code = process.wait()
+        finally:
+            log_handle.close()
+
+        should_broadcast = False
+        with self._lock:
+            record = self._instances.get(instance_id)
+            if record is None:
+                return
+            record.process = None
+            record.pid = None
+            record.connected = False
+            record.exit_code = exit_code
+            record.last_seen = time.time()
+            if record.hidden:
+                self._instances.pop(instance_id, None)
+            else:
+                record.lifecycle_state = "exited" if exit_code == 0 else "failed"
+                if exit_code != 0 and record.launch_error is None:
+                    detail = f"Codex exited with status {exit_code}"
+                    if record.log_path:
+                        log_tail = tail_text_file(Path(record.log_path))
+                        if log_tail:
+                            detail = f"{detail}\n\n{log_tail}"
+                    record.launch_error = detail
+            should_broadcast = True
+
+        if should_broadcast:
+            self._broadcast_all()
+
+    def _terminate_helper_process(
+        self, process: subprocess.Popen, timeout_seconds: float = 5.0
+    ) -> None:
+        if process.poll() is not None:
+            return
+        try:
+            process.terminate()
+        except OSError:
+            return
+        try:
+            process.wait(timeout=timeout_seconds)
+            return
+        except subprocess.TimeoutExpired:
+            pass
+        try:
+            process.kill()
+        except OSError:
+            return
+        try:
+            process.wait(timeout=1.0)
+        except subprocess.TimeoutExpired:
+            return
+
+    def _next_display_name_locked(self) -> str:
+        value = self._next_instance_number
+        self._next_instance_number += 1
+        return f"Codex {value}"
+
+    def _build_session_snapshot_locked(self) -> dict[str, object]:
+        instances = [
+            self._build_instance_payload_locked(record)
+            for record in self._sorted_visible_instances_locked()
+        ]
         return {
             "listen_url": self.listen_url,
-            "attached_instances": attached_instances,
+            "can_create_instances": self.node is not None and self.launcher is not None,
+            "instances": instances,
         }
+
+    def _sorted_visible_instances_locked(self) -> list[InstanceRecord]:
+        return sorted(
+            (
+                record
+                for record in self._instances.values()
+                if not record.hidden
+            ),
+            key=lambda record: record.created_at,
+        )
 
     def _build_instance_payload_locked(self, record: InstanceRecord) -> dict[str, object]:
         payload = copy.deepcopy(record.snapshot)
         payload["instance_id"] = record.instance_id
         payload["connected"] = record.connected
-        payload["control_key_hint"] = record.control_key_hint
-        payload["display_name"] = f"Codex {record.control_key_hint}"
+        payload["display_name"] = record.display_name
+        payload["lifecycle_state"] = record.lifecycle_state
         payload["last_seen"] = time.strftime(
             "%Y-%m-%d %H:%M:%S", time.localtime(record.last_seen)
         )
+        payload["spawned_by_server"] = record.spawned_by_server
+        payload["launch_error"] = record.launch_error
+        payload["pid"] = record.pid
         return payload
 
     def _broadcast_all(self) -> None:
         with self._lock:
             subscribers = list(self._subscribers.items())
             session_snapshots = {
-                token: self._build_session_snapshot_locked(token)
-                for token in {token for _id, (token, _queue) in subscribers}
+                token: self._build_session_snapshot_locked()
+                for token in {token for _subscriber_id, (token, _queue) in subscribers}
                 if token in self._sessions
             }
         self._broadcast_subscribers(subscribers, session_snapshots)
-
-    def _broadcast_session(self, token: str, snapshot: dict[str, object]) -> None:
-        with self._lock:
-            subscribers = [
-                (subscriber_id, (session_token, subscriber))
-                for subscriber_id, (session_token, subscriber) in self._subscribers.items()
-                if session_token == token
-            ]
-        self._broadcast_subscribers(subscribers, {token: snapshot})
 
     def _broadcast_subscribers(
         self,
@@ -330,7 +519,12 @@ class RemoteConsoleRequestHandler(BaseHTTPRequestHandler):
             token = self.require_auth()
             if token is None:
                 return
-            self.send_json(200, self.server.registry.session_snapshot(token))
+            try:
+                snapshot = self.server.registry.session_snapshot(token)
+            except PermissionError as error:
+                self.send_json(401, {"error": str(error)})
+                return
+            self.send_json(200, snapshot)
             return
         if self.path == "/api/events":
             token = self.require_auth()
@@ -347,17 +541,17 @@ class RemoteConsoleRequestHandler(BaseHTTPRequestHandler):
         if self.path == "/logout":
             self.handle_logout()
             return
-        if self.path == "/api/attach":
+        if self.path == "/api/instances":
             token = self.require_auth()
             if token is None:
                 return
-            self.handle_attach(token)
+            self.handle_create_instance(token)
             return
-        if self.path == "/api/detach":
+        if self.path == "/api/terminate":
             token = self.require_auth()
             if token is None:
                 return
-            self.handle_detach(token)
+            self.handle_terminate_instance(token)
             return
         if self.path == "/api/command":
             token = self.require_auth()
@@ -449,28 +643,21 @@ class RemoteConsoleRequestHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(payload_bytes)
 
-    def handle_attach(self, token: str) -> None:
-        payload = self.read_json_body()
+    def handle_create_instance(self, _token: str) -> None:
+        payload = self.read_json_body(allow_empty=True)
         if payload is None:
             return
-        if not isinstance(payload, dict):
+        if payload not in ({}, None) and not isinstance(payload, dict):
             self.send_json(400, {"error": "request body must be a JSON object"})
             return
-        control_key = coerce_text(payload.get("control_key"))
-        if control_key is None:
-            self.send_json(400, {"error": '"control_key" must be a non-empty string'})
-            return
         try:
-            instance_id, snapshot = self.server.registry.attach_instance(token, control_key)
-        except LookupError as error:
-            self.send_json(404, {"error": str(error)})
+            instance_id, snapshot = self.server.registry.create_instance()
+        except RuntimeError as error:
+            self.send_json(503, {"error": str(error)})
             return
-        except PermissionError as error:
-            self.send_json(401, {"error": str(error)})
-            return
-        self.send_json(200, {"ok": True, "instance_id": instance_id, "snapshot": snapshot})
+        self.send_json(201, {"ok": True, "instance_id": instance_id, "snapshot": snapshot})
 
-    def handle_detach(self, token: str) -> None:
+    def handle_terminate_instance(self, _token: str) -> None:
         payload = self.read_json_body()
         if payload is None:
             return
@@ -482,13 +669,13 @@ class RemoteConsoleRequestHandler(BaseHTTPRequestHandler):
             self.send_json(400, {"error": '"instance_id" must be a non-empty string'})
             return
         try:
-            snapshot = self.server.registry.detach_instance(token, instance_id)
-        except PermissionError as error:
-            self.send_json(401, {"error": str(error)})
+            snapshot = self.server.registry.terminate_instance(instance_id)
+        except LookupError as error:
+            self.send_json(404, {"error": str(error)})
             return
         self.send_json(200, {"ok": True, "snapshot": snapshot})
 
-    def handle_command(self, token: str) -> None:
+    def handle_command(self, _token: str) -> None:
         payload = self.read_json_body()
         if payload is None:
             return
@@ -505,10 +692,7 @@ class RemoteConsoleRequestHandler(BaseHTTPRequestHandler):
             self.send_json(400, {"error": 'control messages must include "sender":"user"'})
             return
         try:
-            self.server.registry.enqueue_command(token, instance_id, command_payload)
-        except PermissionError as error:
-            self.send_json(403, {"error": str(error)})
-            return
+            self.server.registry.enqueue_command(instance_id, command_payload)
         except LookupError as error:
             self.send_json(404, {"error": str(error)})
             return
@@ -525,24 +709,14 @@ class RemoteConsoleRequestHandler(BaseHTTPRequestHandler):
             self.send_json(400, {"error": "request body must be a JSON object"})
             return
         instance_id = coerce_text(payload.get("instance_id"))
-        control_key = coerce_text(payload.get("control_key"))
-        control_key_hint = coerce_text(payload.get("control_key_hint"))
         snapshot = payload.get("snapshot")
         if instance_id is None:
             self.send_json(400, {"error": '"instance_id" must be a non-empty string'})
             return
-        if control_key is None:
-            self.send_json(400, {"error": '"control_key" must be a non-empty string'})
-            return
-        if control_key_hint is None:
-            self.send_json(400, {"error": '"control_key_hint" must be a non-empty string'})
-            return
         if not isinstance(snapshot, dict):
             self.send_json(400, {"error": '"snapshot" must be a JSON object'})
             return
-        self.server.registry.register_instance(
-            instance_id, control_key, control_key_hint, snapshot
-        )
+        self.server.registry.register_instance(instance_id, snapshot)
         self.send_json(200, {"ok": True})
 
     def handle_internal_update(self) -> None:
@@ -662,7 +836,7 @@ class RemoteConsoleRequestHandler(BaseHTTPRequestHandler):
         self.send_json(401, {"error": "authentication required"})
         return None
 
-    def read_json_body(self) -> Optional[object]:
+    def read_json_body(self, allow_empty: bool = False) -> Optional[object]:
         content_length = self.headers.get("Content-Length")
         try:
             size = int(content_length or "0")
@@ -670,6 +844,8 @@ class RemoteConsoleRequestHandler(BaseHTTPRequestHandler):
             self.send_json(400, {"error": "invalid Content-Length"})
             return None
         if size <= 0:
+            if allow_empty:
+                return {}
             self.send_json(400, {"error": "request body must not be empty"})
             return None
         if size > MAX_REQUEST_BODY_BYTES:
@@ -693,7 +869,10 @@ class RemoteConsoleRequestHandler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(payload_bytes)))
         self.send_header("Cache-Control", "no-store")
         self.end_headers()
-        self.wfile.write(payload_bytes)
+        try:
+            self.wfile.write(payload_bytes)
+        except (BrokenPipeError, ConnectionResetError, OSError):
+            return
 
 
 def build_listen_url(bind: str, port: int) -> str:
@@ -721,17 +900,77 @@ def parse_positive_int(value: str) -> int:
     return parsed
 
 
-def parse_args() -> argparse.Namespace:
+def current_python_argv() -> list[str]:
+    if sys.executable:
+        return [sys.executable]
+    return ["python3"]
+
+
+def default_instance_snapshot() -> dict[str, object]:
+    return {
+        "mode": "chat",
+        "status": "idle",
+        "turn_in_flight": False,
+        "queued_chat_messages": 0,
+        "remaining_total": 0,
+        "current_task_remaining": None,
+        "current_task_message": None,
+        "auto_tasks": [],
+        "recent_events": [],
+        "latest_assistant": None,
+        "latest_control": None,
+    }
+
+
+def lifecycle_from_snapshot(snapshot: dict[str, object]) -> str:
+    if snapshot.get("status") == "executing" or snapshot.get("turn_in_flight") is True:
+        return "running"
+    return "idle"
+
+
+def tail_text_file(path: Path, max_bytes: int = 4096) -> Optional[str]:
+    try:
+        with path.open("rb") as handle:
+            handle.seek(0, 2)
+            size = handle.tell()
+            handle.seek(max(0, size - max_bytes))
+            raw = handle.read()
+    except OSError:
+        return None
+    try:
+        text = raw.decode("utf-8", errors="replace").strip()
+    except Exception:
+        return None
+    return text or None
+
+
+def parse_args() -> tuple[argparse.Namespace, list[str]]:
     parser = argparse.ArgumentParser()
     parser.add_argument("--bind", required=True)
     parser.add_argument("--port", type=parse_positive_int, required=True)
     parser.add_argument("--password", required=True)
-    return parser.parse_args()
+    parser.add_argument("--node")
+    parser.add_argument("--launcher")
+    parser.add_argument("passthrough", nargs=argparse.REMAINDER)
+    args = parser.parse_args()
+
+    passthrough = list(args.passthrough)
+    if passthrough and passthrough[0] == "--":
+        passthrough = passthrough[1:]
+
+    return args, passthrough
 
 
 def main() -> int:
-    args = parse_args()
-    registry = ConsoleRegistry(args.bind, args.port, args.password)
+    args, passthrough = parse_args()
+    registry = ConsoleRegistry(
+        args.bind,
+        args.port,
+        args.password,
+        args.node,
+        args.launcher,
+        passthrough,
+    )
     server = RemoteConsoleHTTPServer(
         (args.bind, args.port),
         RemoteConsoleRequestHandler,
@@ -743,6 +982,7 @@ def main() -> int:
     except KeyboardInterrupt:
         pass
     finally:
+        registry.shutdown()
         server.server_close()
     return 0
 

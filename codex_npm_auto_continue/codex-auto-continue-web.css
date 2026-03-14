@@ -297,6 +297,12 @@ button.danger {
   color: var(--danger);
 }
 
+.pill.starting,
+.pill.stopping {
+  background: rgba(127, 92, 34, 0.12);
+  color: #7b5311;
+}
+
 .tab-list {
   display: flex;
   gap: 12px;
@@ -352,8 +358,17 @@ button.danger {
   background: #b7862d;
 }
 
+.tab-status.starting,
+.tab-status.stopping {
+  background: #b7862d;
+}
+
 .tab-status.idle {
   background: var(--accent);
+}
+
+.tab-status.failed {
+  background: var(--danger);
 }
 
 .tab-status.offline {
@@ -383,7 +398,7 @@ button.danger {
 
 .attach-form {
   display: grid;
-  grid-template-columns: minmax(0, 1fr) auto;
+  grid-template-columns: auto;
   gap: 12px;
   align-items: end;
 }

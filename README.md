@@ -1,18 +1,34 @@
 # Codex Auto-Continue Patch
 
-这套文件是给你本机 npm 安装版 `codex` 打补丁用的，目标是给交互式 `codex`
-增加一个“私有网页控制台”远程控制方案：
+这套补丁给本机 npm 安装版 `codex` 增加一个“私有网页控制台”方案。
 
-- 默认进入 `chat mode`
-- 通过一个共享网页控制台管理多个运行中的 Codex 实例
-- 每次启动都会打印一个当前 Codex 实例专属的 `control key`
-- turn 完成后网页实时看到 Codex 回复和控制回执
-- `--auto-mode` 仍可从启动时直接带一个默认自动任务
-- `--native` 回到原始 Codex，不启用补丁逻辑
+当前主流程已经改成：
 
-当前实现只支持 Unix / Linux / macOS；Windows 适配和旧的 ntfy transport 已移除。
+- 先启动一个本地常驻 manager：`codex --web-console`
+- 浏览器登录网页控制台
+- 在网页里点击“新建标签页”
+- manager 在后台自动启动一个新的 Codex PTY 会话
+- 每个标签页对应一个独立的 Codex 实例
 
-## 当前语义
+第一阶段目标是本地可跑、后续易于公网部署；不再依赖 ntfy，也不再依赖手动输入 key。
+
+## 当前能力
+
+- 单用户密码登录
+- 多标签页管理多个 Codex 实例
+- 网页直接新建后台 Codex 会话
+- `chat` 模式发送消息
+- `auto` 模式设置任务队列
+- `stop_auto`
+- 查看当前模式、空闲/执行中/启动中/失败状态
+- 查看 chat 队列长度
+- 查看 auto 剩余任务进度
+- 查看最近 Codex 回复和控制回执
+- SSE 实时刷新前端状态
+
+当前实现只支持 Unix / Linux / macOS；Windows 代码和旧 ntfy transport 已移除。
+
+## 语义保持不变
 
 下面这些行为保持不变：
 
@@ -32,9 +48,9 @@
 - `install_codex_auto_continue_patch.py`：安装脚本
 - `uninstall_codex_auto_continue_patch.py`：卸载脚本
 - `codex_npm_auto_continue/codex-wrapper.js`：替换 npm `codex.js` 的 wrapper
-- `codex_npm_auto_continue/codex-auto-continue-pty.py`：Unix PTY bridge + helper 注册/控制逻辑
+- `codex_npm_auto_continue/codex-auto-continue-pty.py`：Unix PTY bridge + helper
 - `codex_npm_auto_continue/codex-auto-continue-notify.py`：接收 Codex turn 完成通知
-- `codex_npm_auto_continue/codex-auto-continue-web-server.py`：共享网页控制台服务
+- `codex_npm_auto_continue/codex-auto-continue-web-server.py`：本地 manager + 网页控制台服务
 - `codex_npm_auto_continue/codex-auto-continue-web.html`：网页控制台
 - `codex_npm_auto_continue/codex-auto-continue-web.css`：网页控制台样式
 - `codex_npm_auto_continue/codex-auto-continue-web.js`：网页控制台前端逻辑
@@ -57,7 +73,7 @@ python3 install_codex_auto_continue_patch.py --install-dir /path/to/@openai/code
 
 - 解析 `codex` 实际指向的 npm 包目录
 - 备份原始 `bin/codex.js` 为 `bin/codex.real.js`
-- 把 wrapper、helper、共享网页服务、网页静态资源复制到同一个 `bin/` 目录
+- 把 wrapper、helper、manager、网页静态资源复制到同一个 `bin/` 目录
 
 ## 卸载
 
@@ -75,14 +91,14 @@ python3 uninstall_codex_auto_continue_patch.py --keep-backup
 
 remote 配置从 Codex 使用的同一个 `config.toml` 路径读取。
 
-默认路径是：
+默认路径：
 
 ```bash
 ~/.codex/config.toml
 ```
 
 如果你平时通过 `CODEX_HOME` 或 `-c config_file="..."` 改过 Codex 的配置路径，
-wrapper 会自动跟着用同一个文件。
+wrapper 会自动跟着使用同一个文件。
 
 最小配置：
 
@@ -112,12 +128,12 @@ codex-remote-web-password = "change-me-now"
 - `codex-remote-web-port`：网页控制台监听端口；默认 `8765`
 - `codex-remote-web-password`：网页登录密码；必填
 
-`control key` 不写入配置文件，它会在每次启动 `codex` 时由 helper 现场生成，并在终端打印出来。
-helper 重启后，旧 key 自动失效。
-它不是 Codex `/status` 里的 session id，也不依赖 `codex resume <id>`。
-网页登录只需要密码；`control key` 在登录后新增标签页时输入。
+现在不再使用：
 
-如果当前是 chat / auto 模式，但没有找到 `codex-remote-web-password`，wrapper 会警告并自动退回 native 模式。
+- 网页输入 `control key`
+- 用 `/status` 里的 Codex session id 绑定网页标签页
+
+网页和实例的绑定关系由本地 manager 内部维护，标签页只认 manager 的内部 `instance_id`。
 
 ## 快速开始
 
@@ -133,26 +149,26 @@ python3 install_codex_auto_continue_patch.py
 codex-remote-web-password = "change-me-now"
 ```
 
-3. 在电脑上启动 Codex
+3. 启动本地 manager
 
 ```bash
-codex
+codex --web-console
 ```
 
-4. 终端里会打印共享网页地址和本次启动的 control key，例如：
+4. 浏览器打开终端打印出来的地址，例如：
 
 ```text
-[codex-auto-continue] private web console on "http://127.0.0.1:8765/" from /home/you/.codex/config.toml.
-[codex-auto-continue] control key for this Codex: JYk1xwQ4dP6k4uCqf7x95QxP
+http://127.0.0.1:8765/
 ```
 
-5. 浏览器打开这个地址，先用配置文件里的网页登录密码登录
+5. 用配置文件里的网页登录密码登录
 
-6. 登录后，在页面上方点击/填写“新标签页 Key”，输入终端刚打印出来的 `control key`
+6. 点击页面上方“新建标签页”
 
-7. 在网页里：
+7. 等待新标签页从“启动中”变成“空闲”
 
-- 每个标签页对应一个正在运行的 Codex 实例
+8. 在网页里：
+
 - `Chat 模式` 面板发送消息
 - `Auto 模式` 面板提交任务队列 JSON，例如：
 
@@ -161,39 +177,66 @@ codex
 ```
 
 - 点击 `stop_auto` 可以在当前 turn 完成后停掉 auto
-- 可以继续新增别的标签页，并输入其他 Codex 实例的 key
-- 在页面右侧查看当前标签页对应实例的最近 Codex 回复和控制回执
+- 右侧查看最近 Codex 回复和控制回执
 
-## 使用
+## 使用方式
 
-直接启动：
+### 推荐方式：网页创建 Codex
+
+启动 manager：
 
 ```bash
-codex
+codex --web-console
 ```
 
-显式指定模式：
+这条命令会前台运行本地网页服务。你可以：
+
+- 直接在当前 shell 保持运行
+- 放到 `tmux` / `screen`
+- 或者用 `nohup` / `systemd --user` / `supervisord` 之类方式常驻
+
+如果你直接在前台用 `Ctrl+C` 停掉 `codex --web-console`，它会一并终止当前由网页创建的后台 Codex 实例。
+
+### 网页内操作
+
+登录后可以：
+
+- 新建标签页：后台启动一个新的空白 `chat` 会话
+- 发送 chat 消息
+- 更新 auto 队列
+- 发送 `stop_auto`
+- 关闭某个实例
+- 查看每个实例的状态、队列、剩余任务、最近回复、最近回执
+
+说明：
+
+- 对网页刚新建的后台实例，第一条自动发送的消息会在 Codex TUI 启动稳定后再注入，所以首条消息可能会比后续消息多等几秒。
+
+### 可选兼容方式：手动启动交互式 Codex
+
+如果你仍然手动启动：
 
 ```bash
 codex --chat-mode
 ```
 
+或：
+
 ```bash
 codex --auto-mode
 ```
+
+这个交互式实例在连接到本地 manager 后，也会自动出现在网页标签页里，不再需要手动输入 key。
+
+### 回到原始 Codex
 
 ```bash
 codex --native
 ```
 
-常用行为：
+### auto 启动参数
 
-- `codex`：默认 chat 模式，等待网页端控制消息
-- `codex --chat-mode`：显式进入 chat 模式
-- `codex --auto-mode`：显式进入 auto 模式
-- `codex --native`：跳过 wrapper，进入原始 Codex
-
-auto 模式下自定义启动任务 prompt：
+交互式 `auto` 模式下自定义启动任务 prompt：
 
 ```bash
 codex --auto-mode --auto-continue-prompt "继续"
@@ -205,7 +248,19 @@ codex --auto-mode --auto-continue-prompt "继续"
 codex --auto-mode --auto-continue-limit 3
 ```
 
-运行时网页端实际发送到 helper 的控制协议仍然是统一 JSON 语义：
+### 给网页创建的实例带默认 Codex 参数
+
+如果你希望网页里新建的所有实例默认继承某些 Codex 参数，可以在启动 manager 时一起带上：
+
+```bash
+codex --web-console -c model=\"gpt-5\" -c approval_policy=\"never\"
+```
+
+之后网页里每次“新建标签页”，都会用这些额外参数去启动新的 Codex 实例。
+
+## 控制协议
+
+网页端发给 helper 的控制语义仍然保持统一 JSON。
 
 chat：
 
@@ -227,74 +282,88 @@ stop_auto：
 
 网页会显示：
 
-- 当前已连接的 Codex 标签页列表
+- 当前标签页列表
 - 当前模式
-- 空闲 / 执行中状态
+- 空闲 / 执行中 / 启动中 / 失败状态
 - chat 队列长度
 - auto 剩余总数
 - 当前 auto 任务内容与剩余次数
-- 当前标签页对应实例的 key 摘要
 - 最近 Codex 回复
 - 最近控制回执与状态事件
 
-如果你本地手动按裸 `Esc` 或 `Ctrl+C`，本场会话会立刻切回 manual。
+## 本地验证
 
-## 本地启动与验证
+建议按下面方式本地验收一遍：
 
-建议按下面方式本地验证一遍：
+1. 启动 manager
 
-1. 启动 `codex`
-2. 再启动第二个 `codex`
-3. 浏览器打开网页并登录
-   - 只输入配置密码
-4. 新建第一个标签页
-   - 输入第一个终端打印的 `control key`
-5. 新建第二个标签页
-   - 输入第二个终端打印的 `control key`
-6. 切换到任一标签页，在 `Chat 模式` 发送一条消息
-7. 等 turn 完成，确认页面只在当前标签页看到对应 Codex 的回复
-8. 切到 `Auto 模式`，提交：
+```bash
+codex --web-console
+```
+
+2. 浏览器打开网页并登录
+
+3. 点击“新建标签页”
+
+4. 等实例变成 `空闲`
+
+5. 发送一条 chat 消息
+
+6. 等 turn 完成，确认网页出现回复和回执
+
+7. 切到 `Auto 模式`，提交：
 
 ```json
 [{"message":"继续","count":2}]
 ```
 
-9. 确认当前 turn 完成后继续执行，并看到剩余次数递减
-10. 点击 `stop_auto`，确认在当前 turn 完成后回到 manual
+8. 确认当前 turn 完成后自动继续
+
+9. 执行中点击 `stop_auto`
+
+10. 确认只在当前 turn 完成后停掉 auto
+
+11. 再新建第二个标签页，确认两个实例互不串线
+
+## 故障排查
+
+### 登录成功但“新建标签页”失败
+
+优先检查：
+
+- `codex --web-console` 这个 manager 是否是用当前 patch 后的 `codex` 启动的
+- `bin/codex.real.js` 是否还存在
+- `python3` / `python` 是否在 PATH
+- `node` 是否是 npm 安装版 `codex` 正在使用的那份运行时
+
+### 网页能看到实例，但发消息失败
+
+先看标签页状态：
+
+- `启动中`：等 helper 完成注册
+- `失败`：查看标签页里的错误信息
+- `离线` / `已退出`：对应 helper 或 Codex 子进程已经结束
+
+### `/status` 里的 session id 不能用于网页绑定
+
+这是预期行为。网页现在不使用 Codex 原生 session id，也不使用 `codex resume <id>` 去建立控制关系。
+网页只使用本地 manager 创建和维护的实例记录。
 
 ## 公网部署建议
 
-第一阶段先本地跑通即可；后续要挂公网时，建议至少做到：
+第一阶段先本地跑通；后续如果要挂到公网，建议至少做到：
 
-- 用 Nginx 或 Caddy 做反向代理，不要直接裸露 helper 监听端口
-- 强制 HTTPS
-- 使用强密码，不要复用弱口令
-- `control key` 只通过当前终端查看，不要记录到长期共享文档里
-- 监听地址改成内网地址或 `127.0.0.1`，由反代暴露外层入口
-- 在反代层加基础限流
-- 最好限制来源 IP 或再套一层额外认证
-- 定期轮换密码
-- 公网环境不要把密码继续明文放在长期共享配置里，后续应迁移到更安全的 secret 管理方式
+- manager 先继续只监听 `127.0.0.1`
+- 外层用 Nginx / Caddy 反代公开出去
+- 必须启用 HTTPS
+- 使用足够强的网页登录密码
+- 对登录和写接口做限流
+- 反代层明确拦截 `/internal/*`
+- 如果做公网暴露，不要把 manager 直接绑定到 `0.0.0.0` 后裸奔
+- 建议加一层基础访问控制，例如 VPN、Zero Trust、HTTP Basic Auth、IP 白名单
 
-## 调试
+Nginx / Caddy 反代时，最重要的一条是：
 
-打开 debug 日志：
+- 不要把 `/internal/register`、`/internal/update`、`/internal/unregister`、`/internal/poll` 暴露给公网
 
-```bash
-export CODEX_AUTO_CONTINUE_DEBUG=1
-codex
-```
-
-默认日志路径：
-
-```bash
-/tmp/codex-auto-continue-debug.log
-```
-
-## 已移除
-
-- 旧的 ntfy remote transport
-- Windows / ConPTY 运行路径
-- `--auto-continue`，改用 `--auto-mode`
-- `--no-auto-continue`，改用 `--native`
-- 旧的 ntfy 配置项与相关 CLI 参数
+这些接口是给本机 helper 回连 manager 用的。
