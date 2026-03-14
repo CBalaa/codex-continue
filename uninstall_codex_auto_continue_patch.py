@@ -9,6 +9,7 @@ from pathlib import Path
 PATCHED_FILES = [
     "codex-auto-continue-pty.py",
     "codex-auto-continue-notify.py",
+    "codex-auto-continue-web-server.py",
     "codex-auto-continue-web.html",
     "codex-auto-continue-web.css",
     "codex-auto-continue-web.js",

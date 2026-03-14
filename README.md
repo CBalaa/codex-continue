@@ -4,7 +4,7 @@
 增加一个“私有网页控制台”远程控制方案：
 
 - 默认进入 `chat mode`
-- 通过本地网页登录后发送 chat / auto 控制命令
+- 通过一个共享网页控制台管理多个运行中的 Codex 实例
 - 每次启动都会打印一个当前 Codex 实例专属的 `control key`
 - turn 完成后网页实时看到 Codex 回复和控制回执
 - `--auto-mode` 仍可从启动时直接带一个默认自动任务
@@ -32,8 +32,9 @@
 - `install_codex_auto_continue_patch.py`：安装脚本
 - `uninstall_codex_auto_continue_patch.py`：卸载脚本
 - `codex_npm_auto_continue/codex-wrapper.js`：替换 npm `codex.js` 的 wrapper
-- `codex_npm_auto_continue/codex-auto-continue-pty.py`：Unix PTY bridge + 网页控制台后端
+- `codex_npm_auto_continue/codex-auto-continue-pty.py`：Unix PTY bridge + helper 注册/控制逻辑
 - `codex_npm_auto_continue/codex-auto-continue-notify.py`：接收 Codex turn 完成通知
+- `codex_npm_auto_continue/codex-auto-continue-web-server.py`：共享网页控制台服务
 - `codex_npm_auto_continue/codex-auto-continue-web.html`：网页控制台
 - `codex_npm_auto_continue/codex-auto-continue-web.css`：网页控制台样式
 - `codex_npm_auto_continue/codex-auto-continue-web.js`：网页控制台前端逻辑
@@ -56,7 +57,7 @@ python3 install_codex_auto_continue_patch.py --install-dir /path/to/@openai/code
 
 - 解析 `codex` 实际指向的 npm 包目录
 - 备份原始 `bin/codex.js` 为 `bin/codex.real.js`
-- 把 wrapper、helper、网页静态资源复制到同一个 `bin/` 目录
+- 把 wrapper、helper、共享网页服务、网页静态资源复制到同一个 `bin/` 目录
 
 ## 卸载
 
@@ -114,6 +115,7 @@ codex-remote-web-password = "change-me-now"
 `control key` 不写入配置文件，它会在每次启动 `codex` 时由 helper 现场生成，并在终端打印出来。
 helper 重启后，旧 key 自动失效。
 它不是 Codex `/status` 里的 session id，也不依赖 `codex resume <id>`。
+网页登录只需要密码；`control key` 在登录后新增标签页时输入。
 
 如果当前是 chat / auto 模式，但没有找到 `codex-remote-web-password`，wrapper 会警告并自动退回 native 模式。
 
@@ -137,20 +139,20 @@ codex-remote-web-password = "change-me-now"
 codex
 ```
 
-4. 终端里会打印本地网页地址和本次启动的 control key，例如：
+4. 终端里会打印共享网页地址和本次启动的 control key，例如：
 
 ```text
 [codex-auto-continue] private web console on "http://127.0.0.1:8765/" from /home/you/.codex/config.toml.
 [codex-auto-continue] control key for this Codex: JYk1xwQ4dP6k4uCqf7x95QxP
 ```
 
-5. 浏览器打开这个地址，输入：
+5. 浏览器打开这个地址，先用配置文件里的网页登录密码登录
 
-- 配置文件里的网页登录密码
-- 终端刚打印出来的 `control key`
+6. 登录后，在页面上方点击/填写“新标签页 Key”，输入终端刚打印出来的 `control key`
 
-6. 在网页里：
+7. 在网页里：
 
+- 每个标签页对应一个正在运行的 Codex 实例
 - `Chat 模式` 面板发送消息
 - `Auto 模式` 面板提交任务队列 JSON，例如：
 
@@ -159,7 +161,8 @@ codex
 ```
 
 - 点击 `stop_auto` 可以在当前 turn 完成后停掉 auto
-- 在页面右侧查看最近 Codex 回复和控制回执
+- 可以继续新增别的标签页，并输入其他 Codex 实例的 key
+- 在页面右侧查看当前标签页对应实例的最近 Codex 回复和控制回执
 
 ## 使用
 
@@ -224,12 +227,13 @@ stop_auto：
 
 网页会显示：
 
+- 当前已连接的 Codex 标签页列表
 - 当前模式
 - 空闲 / 执行中状态
 - chat 队列长度
 - auto 剩余总数
 - 当前 auto 任务内容与剩余次数
-- 当前已绑定实例的 key 摘要
+- 当前标签页对应实例的 key 摘要
 - 最近 Codex 回复
 - 最近控制回执与状态事件
 
@@ -240,19 +244,23 @@ stop_auto：
 建议按下面方式本地验证一遍：
 
 1. 启动 `codex`
-2. 浏览器打开网页并登录
-   - 输入配置密码
-   - 输入终端刚打印的 `control key`
-3. 在 `Chat 模式` 发送一条消息
-4. 等 turn 完成，确认页面看到 Codex 回复
-5. 切到 `Auto 模式`，提交：
+2. 再启动第二个 `codex`
+3. 浏览器打开网页并登录
+   - 只输入配置密码
+4. 新建第一个标签页
+   - 输入第一个终端打印的 `control key`
+5. 新建第二个标签页
+   - 输入第二个终端打印的 `control key`
+6. 切换到任一标签页，在 `Chat 模式` 发送一条消息
+7. 等 turn 完成，确认页面只在当前标签页看到对应 Codex 的回复
+8. 切到 `Auto 模式`，提交：
 
 ```json
 [{"message":"继续","count":2}]
 ```
 
-6. 确认当前 turn 完成后继续执行，并看到剩余次数递减
-7. 点击 `stop_auto`，确认在当前 turn 完成后回到 manual
+9. 确认当前 turn 完成后继续执行，并看到剩余次数递减
+10. 点击 `stop_auto`，确认在当前 turn 完成后回到 manual
 
 ## 公网部署建议
 

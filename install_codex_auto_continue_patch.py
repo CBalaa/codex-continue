@@ -11,6 +11,7 @@ EXECUTABLE_ASSETS = [
     ASSET_DIR / "codex-wrapper.js",
     ASSET_DIR / "codex-auto-continue-pty.py",
     ASSET_DIR / "codex-auto-continue-notify.py",
+    ASSET_DIR / "codex-auto-continue-web-server.py",
 ]
 STATIC_ASSETS = [
     ASSET_DIR / "codex-auto-continue-web.html",

@@ -11,6 +11,7 @@ import queue
 import secrets
 import shutil
 import socket
+import subprocess
 import sys
 import tempfile
 import threading
@@ -21,6 +22,8 @@ from http import cookies
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Optional
+from urllib import error as urllib_error
+from urllib import request as urllib_request
 
 import fcntl
 import select
@@ -37,6 +40,9 @@ SSE_KEEPALIVE_SECONDS = 15.0
 MAX_RECENT_EVENTS = 40
 MAX_REQUEST_BODY_BYTES = 65536
 MAX_SSE_QUEUE_SIZE = 32
+SERVER_START_TIMEOUT_SECONDS = 5.0
+SERVER_COMMAND_POLL_TIMEOUT_SECONDS = 15.0
+SERVER_REQUEST_TIMEOUT_SECONDS = 5.0
 QUEUE_KEY = b"\t"
 CTRL_C = 3
 ESC = 27
@@ -53,6 +59,7 @@ SESSION_COOKIE_NAME = "codex_remote_session"
 STATIC_HTML = "codex-auto-continue-web.html"
 STATIC_CSS = "codex-auto-continue-web.css"
 STATIC_JS = "codex-auto-continue-web.js"
+SERVER_SCRIPT = "codex-auto-continue-web-server.py"
 
 
 @dataclass
@@ -92,6 +99,309 @@ class StdinHotkeyState:
 class QueuedControlCommand:
     summary: str
     command: RemoteCommand
+
+
+class RemoteConsoleClient:
+    def __init__(
+        self,
+        bind: str,
+        port: int,
+        password: str,
+        control_key: str,
+        control_queue: queue.Queue,
+        stop_event: threading.Event,
+    ):
+        self.bind = bind
+        self.port = port
+        self.password = password
+        self.control_key = control_key
+        self.control_key_hint = mask_secret(control_key)
+        self.control_queue = control_queue
+        self.stop_event = stop_event
+        self.listen_url = build_listen_url(bind, port)
+        self.base_url = self.listen_url.rstrip("/")
+        self.instance_id = secrets.token_urlsafe(18)
+        self._lock = threading.Lock()
+        self._runtime: dict[str, object] = {
+            "mode": MANUAL_MODE,
+            "status": "idle",
+            "turn_in_flight": False,
+            "queued_chat_messages": 0,
+            "remaining_total": 0,
+            "current_task_remaining": None,
+            "current_task_message": None,
+            "auto_tasks": [],
+        }
+        self._recent_events: deque[dict[str, object]] = deque(maxlen=MAX_RECENT_EVENTS)
+        self._latest_assistant: Optional[dict[str, object]] = None
+        self._latest_control: Optional[dict[str, object]] = None
+        self._next_event_id = 1
+        self._next_request_id = 1
+        self._poller_thread: Optional[threading.Thread] = None
+
+    def start(self, initial_state: SessionState) -> None:
+        with self._lock:
+            self._runtime = build_state_payload(initial_state)
+        self._ensure_server_running()
+        self._register_instance()
+        self._poller_thread = threading.Thread(
+            target=self._poll_commands_loop,
+            name="codex-auto-continue-control-poll",
+            daemon=True,
+        )
+        self._poller_thread.start()
+
+    def close(self) -> None:
+        try:
+            self._post_json(
+                "/internal/unregister",
+                {"instance_id": self.instance_id},
+                timeout=1.0,
+            )
+        except Exception as error:
+            debug(f"failed to unregister remote instance: {error}")
+        if self._poller_thread is not None:
+            self._poller_thread.join(timeout=1.0)
+
+    def next_request_summary(self) -> str:
+        with self._lock:
+            request_id = self._next_request_id
+            self._next_request_id += 1
+        return f"web:{request_id}"
+
+    def publish_runtime(self, state: SessionState) -> None:
+        self._publish(runtime=build_state_payload(state))
+
+    def publish_control_response(
+        self, state: SessionState, body: str, error: bool = False
+    ) -> None:
+        payload = build_control_response_payload(state, body, error)
+        self._publish(
+            runtime=build_state_payload(state),
+            recent_event=self._build_recent_event(
+                "control-error" if error else "control-response",
+                payload,
+            ),
+            latest_control=payload,
+        )
+
+    def publish_turn_complete(
+        self, event: dict[str, object], state: SessionState
+    ) -> None:
+        payload = build_turn_notification_payload(event, state)
+        self._publish(
+            runtime=build_state_payload(state),
+            recent_event=self._build_recent_event("assistant", payload),
+            latest_assistant=payload,
+        )
+
+    def publish_system_event(self, state: SessionState, title: str, text: str) -> None:
+        payload = {
+            "sender": CODEX_SENDER,
+            "type": "system-event",
+            "title": title,
+            "text": text,
+            **build_state_payload(state),
+        }
+        self._publish(
+            runtime=build_state_payload(state),
+            recent_event=self._build_recent_event("system", payload),
+        )
+
+    def _publish(
+        self,
+        runtime: Optional[dict[str, object]] = None,
+        recent_event: Optional[dict[str, object]] = None,
+        latest_assistant: Optional[dict[str, object]] = None,
+        latest_control: Optional[dict[str, object]] = None,
+    ) -> None:
+        with self._lock:
+            if runtime is not None:
+                self._runtime = copy.deepcopy(runtime)
+            if recent_event is not None:
+                self._recent_events.appendleft(copy.deepcopy(recent_event))
+            if latest_assistant is not None:
+                self._latest_assistant = copy.deepcopy(latest_assistant)
+            if latest_control is not None:
+                self._latest_control = copy.deepcopy(latest_control)
+            snapshot = self._build_snapshot_locked()
+        self._sync_snapshot(snapshot)
+
+    def _build_recent_event(
+        self, kind: str, payload: dict[str, object]
+    ) -> dict[str, object]:
+        with self._lock:
+            event_id = self._next_event_id
+            self._next_event_id += 1
+        return {
+            "id": event_id,
+            "timestamp": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime()),
+            "kind": kind,
+            "type": payload.get("type"),
+            "title": payload.get("title") or default_event_title(kind),
+            "text": coerce_notification_text(payload.get("text")) or "",
+            "assistant": payload.get("assistant"),
+            "user": payload.get("user"),
+            "mode": payload.get("mode"),
+            "status": payload.get("status"),
+        }
+
+    def _build_snapshot_locked(self) -> dict[str, object]:
+        return {
+            **copy.deepcopy(self._runtime),
+            "control_key_hint": self.control_key_hint,
+            "recent_events": list(copy.deepcopy(self._recent_events)),
+            "latest_assistant": copy.deepcopy(self._latest_assistant),
+            "latest_control": copy.deepcopy(self._latest_control),
+        }
+
+    def _sync_snapshot(self, snapshot: dict[str, object]) -> None:
+        payload = {
+            "instance_id": self.instance_id,
+            "snapshot": snapshot,
+        }
+        try:
+            self._post_json("/internal/update", payload)
+        except Exception as error:
+            debug(f"snapshot update failed, retrying after server recovery: {error}")
+            self._recover_server()
+            self._post_json("/internal/update", payload)
+
+    def _register_instance(self) -> None:
+        with self._lock:
+            snapshot = self._build_snapshot_locked()
+        self._post_json(
+            "/internal/register",
+            {
+                "instance_id": self.instance_id,
+                "control_key": self.control_key,
+                "control_key_hint": self.control_key_hint,
+                "snapshot": snapshot,
+            },
+        )
+
+    def _recover_server(self) -> None:
+        self._ensure_server_running()
+        self._register_instance()
+
+    def _poll_commands_loop(self) -> None:
+        while not self.stop_event.is_set():
+            try:
+                response = self._post_json(
+                    "/internal/poll",
+                    {
+                        "instance_id": self.instance_id,
+                        "timeout_seconds": SERVER_COMMAND_POLL_TIMEOUT_SECONDS,
+                    },
+                    timeout=SERVER_COMMAND_POLL_TIMEOUT_SECONDS + 2.0,
+                )
+                command_payload = response.get("command")
+                if command_payload is None:
+                    continue
+                if not isinstance(command_payload, dict):
+                    debug(f"ignored malformed command payload: {command_payload!r}")
+                    continue
+                try:
+                    command = parse_remote_command_message(
+                        json.dumps(command_payload, ensure_ascii=False)
+                    )
+                except ValueError as error:
+                    debug(f"ignored invalid remote command: {error}")
+                    continue
+                if command is None:
+                    continue
+                self.control_queue.put(
+                    QueuedControlCommand(
+                        summary=self.next_request_summary(),
+                        command=command,
+                    )
+                )
+            except Exception as error:
+                if self.stop_event.is_set():
+                    return
+                debug(f"control poll failed, retrying after recovery: {error}")
+                time.sleep(0.5)
+                try:
+                    self._recover_server()
+                except Exception as recovery_error:
+                    debug(f"server recovery failed: {recovery_error}")
+                    time.sleep(1.0)
+
+    def _ensure_server_running(self) -> None:
+        if self._healthcheck():
+            return
+
+        server_path = Path(__file__).with_name(SERVER_SCRIPT)
+        python_argv = [*current_python_argv(), str(server_path)]
+        debug(
+            "starting remote console server at "
+            f"{self.listen_url} with script={server_path}"
+        )
+        server_process = subprocess.Popen(
+            [
+                *python_argv,
+                "--bind",
+                self.bind,
+                "--port",
+                str(self.port),
+                "--password",
+                self.password,
+            ],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+            close_fds=True,
+        )
+
+        deadline = time.monotonic() + SERVER_START_TIMEOUT_SECONDS
+        while time.monotonic() < deadline:
+            if self._healthcheck():
+                return
+            if server_process.poll() is not None and self._healthcheck():
+                return
+            time.sleep(0.1)
+
+        raise RuntimeError(f"web console server did not become ready at {self.listen_url}")
+
+    def _healthcheck(self) -> bool:
+        try:
+            payload = self._request_json("GET", "/healthz", None, timeout=1.0)
+        except Exception:
+            return False
+        return payload.get("ok") is True
+
+    def _post_json(
+        self, path: str, payload: dict[str, object], timeout: float = SERVER_REQUEST_TIMEOUT_SECONDS
+    ) -> dict[str, object]:
+        return self._request_json("POST", path, payload, timeout=timeout)
+
+    def _request_json(
+        self,
+        method: str,
+        path: str,
+        payload: Optional[dict[str, object]],
+        timeout: float,
+    ) -> dict[str, object]:
+        request_payload = None if payload is None else encode_json(payload)
+        request = urllib_request.Request(
+            f"{self.base_url}{path}",
+            data=request_payload,
+            headers={"Content-Type": "application/json"},
+            method=method,
+        )
+        try:
+            with urllib_request.urlopen(request, timeout=timeout) as response:
+                return json.loads(response.read().decode("utf-8"))
+        except urllib_error.HTTPError as error:
+            try:
+                error_body = json.loads(error.read().decode("utf-8"))
+            except Exception:
+                error_body = {}
+            raise RuntimeError(
+                error_body.get("error")
+                or f"{method} {path} failed with status {error.code}"
+            ) from error
 
 
 class WebConsoleStateHub:
@@ -1078,7 +1388,7 @@ def copy_winsize_unix(source_fd: int, target_fd: int) -> None:
         pass
 
 
-def start_web_console(
+def start_remote_console_client(
     bind: str,
     port: int,
     password: str,
@@ -1086,25 +1396,17 @@ def start_web_console(
     control_queue: queue.Queue,
     stop_event: threading.Event,
     initial_state: SessionState,
-) -> tuple[RemoteControlHTTPServer, threading.Thread, WebConsoleStateHub]:
-    hub = WebConsoleStateHub(bind, port, password, control_key)
-    hub.publish_runtime(initial_state)
-    server = RemoteControlHTTPServer(
-        (bind, port),
-        RemoteControlRequestHandler,
-        hub,
+) -> RemoteConsoleClient:
+    client = RemoteConsoleClient(
+        bind,
+        port,
+        password,
+        control_key,
         control_queue,
         stop_event,
-        Path(__file__).resolve().parent,
     )
-    thread = threading.Thread(
-        target=server.serve_forever,
-        kwargs={"poll_interval": 0.2},
-        name="codex-auto-continue-web",
-        daemon=True,
-    )
-    thread.start()
-    return server, thread, hub
+    client.start(initial_state)
+    return client
 
 
 def launch_child_unix(args: argparse.Namespace, passthrough: list[str]) -> int:
@@ -1169,15 +1471,33 @@ def forward_loop_unix(
     stop_event = threading.Event()
     control_queue: queue.Queue = queue.Queue()
     control_key = secrets.token_urlsafe(18)
-    web_server, web_thread, hub = start_web_console(
-        web_bind,
-        web_port,
-        web_password,
-        control_key,
-        control_queue,
-        stop_event,
-        session_state,
-    )
+    try:
+        hub = start_remote_console_client(
+            web_bind,
+            web_port,
+            web_password,
+            control_key,
+            control_queue,
+            stop_event,
+            session_state,
+        )
+    except Exception as error:
+        os.write(
+            stderr_fd,
+            (
+                "[codex-auto-continue] failed to start the shared web console: "
+                f"{error}\r\n"
+            ).encode("utf-8"),
+        )
+        try:
+            os.kill(child_pid, signal.SIGTERM)
+        except OSError:
+            pass
+        try:
+            os.waitpid(child_pid, 0)
+        except OSError:
+            pass
+        return 1
 
     os.write(
         stderr_fd,
@@ -1188,7 +1508,7 @@ def forward_loop_unix(
     )
     os.write(
         stderr_fd,
-        b"[codex-auto-continue] enter this key in the web console login form.\r\n",
+        b"[codex-auto-continue] log in to the shared web console, then add a tab with this key.\r\n",
     )
 
     tty.setraw(stdin_fd)
@@ -1361,9 +1681,7 @@ def forward_loop_unix(
         stop_event.set()
         signal.signal(signal.SIGWINCH, previous_sigwinch)
         termios.tcsetattr(stdin_fd, termios.TCSADRAIN, old_tty_settings)
-        web_server.shutdown()
-        web_server.server_close()
-        web_thread.join(timeout=1.0)
+        hub.close()
 
     _, status = os.waitpid(child_pid, 0)
     if os.WIFSIGNALED(status):

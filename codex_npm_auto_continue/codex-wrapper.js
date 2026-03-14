@@ -494,7 +494,7 @@ async function main() {
     );
   } else {
     console.error(
-      "[codex-auto-continue] chat mode enabled; open the private web console to send messages; " +
+      "[codex-auto-continue] chat mode enabled; open the shared private web console to send messages; " +
         "press bare Esc or Ctrl+C to switch to manual mode.",
     );
   }
@@ -509,7 +509,7 @@ async function main() {
     )} from ${webSettings.configPath}.`,
   );
   console.error(
-    "[codex-auto-continue] the helper will print a startup control key for this Codex instance.",
+    "[codex-auto-continue] the helper will print a startup control key; add a new tab with that key after login.",
   );
 
   const [pythonCommand, ...pythonArgs] = python;
