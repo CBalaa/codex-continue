@@ -40,10 +40,38 @@
 第一个终端启动网页服务器：
 
 ```bash
+HASH="$(python3 - <<'PY'
+import base64
+import hashlib
+import secrets
+
+iterations = 240000
+salt = secrets.token_bytes(16)
+digest = hashlib.pbkdf2_hmac("sha256", b"change-me-now", salt, iterations)
+
+def enc(value: bytes) -> str:
+    return base64.urlsafe_b64encode(value).decode().rstrip("=")
+
+print(f"pbkdf2_sha256${iterations}${enc(salt)}${enc(digest)}")
+PY
+)"
+
+cat > server/users.local.json <<EOF
+{
+  "users": [
+    {
+      "username": "alice",
+      "password_hash": "$HASH"
+    }
+  ]
+}
+EOF
+
 ./server/start \
   --bind 127.0.0.1 \
   --port 8765 \
-  --password change-me-now
+  --users-file server/users.local.json \
+  --state-file server/state.local.json
 ```
 
 第二个终端启动本地 agent：
@@ -58,10 +86,11 @@
 然后：
 
 1. 打开 `http://127.0.0.1:8765/`
-2. 输入网页密码 `change-me-now`
-3. 输入 agent 启动时打印出来的 machine key
-4. 点击“新建标签页”
-5. 在网页里发送 chat / auto / stop_auto
+2. 输入账号 `alice`
+3. 输入密码 `change-me-now`
+4. 输入 agent 启动时打印出来的 machine key
+5. 点击“新建标签页”
+6. 在网页里发送 chat / auto / stop_auto
 
 ## 运行链路
 
@@ -93,20 +122,69 @@ python3 --version
 
 下面默认你就在仓库根目录里。
 
+### 准备用户文件
+
+服务端现在不再使用单一网页登录密码，而是使用本地 `users.json` 文件。
+
+密码哈希格式：
+
+```text
+pbkdf2_sha256$<iterations>$<salt_base64url>$<digest_base64url>
+```
+
+可以用下面的命令生成密码为 `change-me-now` 的哈希：
+
+```bash
+python3 - <<'PY'
+import base64
+import hashlib
+import secrets
+
+iterations = 240000
+salt = secrets.token_bytes(16)
+digest = hashlib.pbkdf2_hmac("sha256", b"change-me-now", salt, iterations)
+
+def enc(value: bytes) -> str:
+    return base64.urlsafe_b64encode(value).decode().rstrip("=")
+
+print(f"pbkdf2_sha256${iterations}${enc(salt)}${enc(digest)}")
+PY
+```
+
+把输出结果填进 `server/users.local.json`：
+
+```json
+{
+  "users": [
+    {
+      "username": "alice",
+      "password_hash": "把上面生成的哈希填到这里"
+    }
+  ]
+}
+```
+
+`server/state.local.json` 不需要手工创建；第一台机器首次被认领时会自动生成。这个文件用来持久保存：
+
+- machine key 归属到哪个用户
+- 服务端重启后仍然保留的机器归属关系
+
 ### 启动网页服务器
 
 ```bash
 ./server/start \
   --bind 127.0.0.1 \
   --port 8765 \
-  --password change-me-now
+  --users-file server/users.local.json \
+  --state-file server/state.local.json
 ```
 
 参数说明：
 
 - `--bind`：网页服务器监听地址
 - `--port`：网页服务器端口
-- `--password`：网页登录密码
+- `--users-file`：用户配置文件，里面包含账号和密码哈希
+- `--state-file`：服务端状态文件，里面保存机器归属关系
 
 ### 启动本地 agent
 
@@ -132,7 +210,7 @@ agent 启动后会打印：
 也可以通过 npm 执行当前目录脚本：
 
 ```bash
-npm run server -- --bind 127.0.0.1 --port 8765 --password change-me-now
+npm run server -- --bind 127.0.0.1 --port 8765 --users-file server/users.local.json --state-file server/state.local.json
 npm run client -- --server-url http://127.0.0.1:8765 --machine-key-file ~/.codex/codex-auto-continue-machine-key.txt --machine-name local-test
 ```
 
@@ -157,11 +235,12 @@ npm run client -- --server-url http://127.0.0.1:8765 --machine-key-file ~/.codex
 ## 网页里的使用流程
 
 1. 浏览器打开 `http://127.0.0.1:8765/`
-2. 输入网页登录密码
+2. 输入账号和密码
 3. 输入 machine key，连接目标 agent
-4. 点击“新建标签页”
-5. 等待实例从 `starting` 变成 `idle`
-6. 在网页里发送 chat / auto / stop_auto
+4. 如果这台机器还没有归属用户，那么首次连接时会自动归属到当前账号
+5. 点击“新建标签页”
+6. 等待实例从 `starting` 变成 `idle`
+7. 在网页里发送 chat / auto / stop_auto
 
 ## Launch Script 契约
 
@@ -173,7 +252,8 @@ npm run client -- --server-url http://127.0.0.1:8765 --machine-key-file ~/.codex
 client/codex-auto-continue-launch server \
   --bind <bind> \
   --port <port> \
-  --password <password>
+  --users-file <users.json> \
+  --state-file <state.json>
 ```
 
 本地 agent：

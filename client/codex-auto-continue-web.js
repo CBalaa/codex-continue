@@ -2,9 +2,11 @@ const authPanel = document.getElementById("authPanel");
 const consolePanel = document.getElementById("consolePanel");
 const loginForm = document.getElementById("loginForm");
 const loginError = document.getElementById("loginError");
+const usernameInput = document.getElementById("usernameInput");
 const passwordInput = document.getElementById("passwordInput");
 const logoutButton = document.getElementById("logoutButton");
 const listenUrl = document.getElementById("listenUrl");
+const userBadge = document.getElementById("userBadge");
 const machineBadge = document.getElementById("machineBadge");
 const activeTabBadge = document.getElementById("activeTabBadge");
 const streamState = document.getElementById("streamState");
@@ -49,6 +51,32 @@ let snapshot = null;
 let activeInstanceId = null;
 let eventSource = null;
 let pendingSelectNewest = false;
+
+function isLoopbackHost(hostname) {
+  return (
+    hostname === "localhost" ||
+    hostname === "127.0.0.1" ||
+    hostname === "::1" ||
+    hostname.startsWith("127.")
+  );
+}
+
+function displayListenUrl(rawUrl) {
+  if (!rawUrl) {
+    return `${window.location.origin}/`;
+  }
+
+  try {
+    const listen = new URL(rawUrl, window.location.origin);
+    const current = new URL(window.location.origin);
+    if (isLoopbackHost(listen.hostname) && !isLoopbackHost(current.hostname)) {
+      return `${current.origin}/`;
+    }
+    return listen.toString();
+  } catch {
+    return rawUrl;
+  }
+}
 
 function modeLabel(mode) {
   if (mode === "chat") return "chat";
@@ -130,6 +158,13 @@ function instances(value = snapshot) {
   return value?.instances || value?.attached_instances || [];
 }
 
+function viewerUsername(value = snapshot) {
+  if (!value || typeof value !== "object") {
+    return null;
+  }
+  return typeof value.viewer_username === "string" ? value.viewer_username : null;
+}
+
 function selectedInstance() {
   return instances().find((item) => item.instance_id === activeInstanceId) || null;
 }
@@ -148,7 +183,15 @@ function selectFallbackInstance() {
 function applySnapshot(nextSnapshot) {
   const previousInstanceIds = new Set(instances().map((item) => item.instance_id));
   snapshot = nextSnapshot;
-  listenUrl.textContent = nextSnapshot.listen_url || window.location.origin;
+  listenUrl.textContent = displayListenUrl(nextSnapshot.listen_url);
+  const username = viewerUsername(nextSnapshot);
+  if (username) {
+    userBadge.hidden = false;
+    userBadge.textContent = `用户 ${username}`;
+  } else {
+    userBadge.hidden = true;
+    userBadge.textContent = "未登录";
+  }
 
   if (pendingSelectNewest) {
     const nextInstances = instances(nextSnapshot);
@@ -185,7 +228,7 @@ function renderMachinePanel() {
   machinePanel.hidden = false;
   const machine = attachedMachine();
   if (!machine) {
-    machinePanelHint.textContent = "输入本地 agent 启动时打印出来的机器 key。";
+    machinePanelHint.textContent = "输入当前账号拥有的 machine key。首次连接在线机器时会自动认领。";
     machineStateText.textContent = "未连接";
     machineNameValue.textContent = "未连接";
     machineStatusValue.textContent = "--";
@@ -203,7 +246,7 @@ function renderMachinePanel() {
 
   const online = machine.connected === true;
   machinePanelHint.textContent = online
-    ? "机器已连接，可以继续创建和控制标签页。"
+    ? "当前账号已连接到这台机器，可以继续创建和控制标签页。"
     : "机器已离线，等待 agent 重新连回，或断开后连接其它机器。";
   machineStateText.textContent = online ? "已连接" : "已离线";
   machineNameValue.textContent = machine.display_name || "Machine";
@@ -482,6 +525,8 @@ function setLoggedOut() {
   authPanel.hidden = false;
   consolePanel.hidden = true;
   logoutButton.hidden = true;
+  userBadge.hidden = true;
+  userBadge.textContent = "未登录";
   machineBadge.hidden = true;
   activeTabBadge.hidden = true;
   activeTabBadge.textContent = "未选择标签页";
@@ -579,7 +624,12 @@ function showCommandError(error) {
 loginForm.addEventListener("submit", async (event) => {
   event.preventDefault();
   loginError.textContent = "";
+  const username = usernameInput.value.trim();
   const password = passwordInput.value.trim();
+  if (!username) {
+    loginError.textContent = "请输入账号";
+    return;
+  }
   if (!password) {
     loginError.textContent = "请输入密码";
     return;
@@ -587,7 +637,7 @@ loginForm.addEventListener("submit", async (event) => {
 
   const response = await request("/login", {
     method: "POST",
-    body: JSON.stringify({ password }),
+    body: JSON.stringify({ username, password }),
   });
   const data = await response.json().catch(() => ({}));
   if (!response.ok) {

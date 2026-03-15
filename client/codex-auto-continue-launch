@@ -38,7 +38,8 @@ def parse_args() -> tuple[argparse.Namespace, list[str]]:
     server_parser = subparsers.add_parser("server")
     server_parser.add_argument("--bind", required=True)
     server_parser.add_argument("--port", required=True)
-    server_parser.add_argument("--password", required=True)
+    server_parser.add_argument("--users-file", required=True)
+    server_parser.add_argument("--state-file", required=True)
 
     agent_parser = subparsers.add_parser("agent")
     agent_parser.add_argument("--server-url", required=True)
@@ -75,8 +76,10 @@ def main() -> int:
                 args.bind,
                 "--port",
                 args.port,
-                "--password",
-                args.password,
+                "--users-file",
+                args.users_file,
+                "--state-file",
+                args.state_file,
             ],
         )
 

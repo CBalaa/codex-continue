@@ -3,10 +3,14 @@
 from __future__ import annotations
 
 import argparse
+import base64
 import copy
+import hashlib
 import json
+import os
 import queue
 import secrets
+import tempfile
 import threading
 import time
 from dataclasses import dataclass, field
@@ -25,10 +29,13 @@ MAX_SSE_QUEUE_SIZE = 32
 MACHINE_STALE_SECONDS = 30.0
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 STATIC_DIR = PROJECT_ROOT / "client"
+PASSWORD_HASH_PREFIX = "pbkdf2_sha256"
+PASSWORD_HASH_DIGEST = "sha256"
 
 
 @dataclass
 class SessionRecord:
+    username: str
     attached_machine_id: Optional[str] = None
 
 
@@ -40,15 +47,25 @@ class MachineRecord:
     display_name: str
     snapshot: dict[str, object]
     command_queue: queue.Queue
+    owner_username: Optional[str] = None
     connected: bool = True
     last_seen: float = field(default_factory=time.time)
 
 
 class RemoteConsoleRegistry:
-    def __init__(self, bind: str, port: int, password: str):
+    def __init__(
+        self,
+        bind: str,
+        port: int,
+        users: dict[str, str],
+        state_path: Path,
+        machine_owners: dict[str, str],
+    ):
         self.bind = bind
         self.port = port
-        self.password = password
+        self._users = dict(users)
+        self._state_path = state_path
+        self._machine_owners = dict(machine_owners)
         self.listen_url = build_listen_url(bind, port)
         self._lock = threading.Lock()
         self._sessions: dict[str, SessionRecord] = {}
@@ -57,13 +74,16 @@ class RemoteConsoleRegistry:
         self._subscribers: dict[int, tuple[str, queue.Queue]] = {}
         self._next_subscriber_id = 1
 
-    def verify_password(self, candidate: str) -> bool:
-        return secrets.compare_digest(candidate, self.password)
+    def verify_login(self, username: str, password: str) -> bool:
+        password_hash = self._users.get(username)
+        if password_hash is None:
+            return False
+        return verify_password_hash(password, password_hash)
 
-    def create_session(self) -> str:
+    def create_session(self, username: str) -> str:
         token = secrets.token_urlsafe(32)
         with self._lock:
-            self._sessions[token] = SessionRecord()
+            self._sessions[token] = SessionRecord(username=username)
         return token
 
     def delete_session(self, token: Optional[str]) -> None:
@@ -101,6 +121,8 @@ class RemoteConsoleRegistry:
 
     def session_snapshot(self, token: str) -> dict[str, object]:
         with self._lock:
+            if token not in self._sessions:
+                raise PermissionError("authentication required")
             return self._build_session_snapshot_locked(token)
 
     def attach_machine(self, token: str, machine_key: str) -> dict[str, object]:
@@ -108,9 +130,20 @@ class RemoteConsoleRegistry:
             session = self._sessions.get(token)
             if session is None:
                 raise PermissionError("authentication required")
+            owner_username = self._machine_owners.get(machine_key)
+            if owner_username is not None and owner_username != session.username:
+                raise PermissionError("machine belongs to another user")
             machine_id = self._machine_key_to_id.get(machine_key)
             if machine_id is None:
-                raise LookupError("invalid machine key")
+                raise LookupError("machine not registered")
+            record = self._machines.get(machine_id)
+            if record is None:
+                raise LookupError("machine not registered")
+            if owner_username is None:
+                self._claim_machine_locked(machine_key, session.username)
+                record.owner_username = session.username
+            else:
+                record.owner_username = owner_username
             session.attached_machine_id = machine_id
             snapshot = self._build_session_snapshot_locked(token)
         self._broadcast_session(token, snapshot)
@@ -167,6 +200,7 @@ class RemoteConsoleRegistry:
                     display_name=machine_name or f"Machine {machine_key_hint}",
                     snapshot=copy.deepcopy(snapshot),
                     command_queue=queue.Queue(),
+                    owner_username=self._machine_owners.get(machine_key),
                     connected=True,
                 )
                 self._machines[machine_id] = record
@@ -174,6 +208,7 @@ class RemoteConsoleRegistry:
             else:
                 record = self._machines[machine_id]
                 record.snapshot = copy.deepcopy(snapshot)
+                record.owner_username = self._machine_owners.get(machine_key)
                 record.connected = True
                 record.last_seen = time.time()
                 if machine_name is not None:
@@ -231,6 +266,8 @@ class RemoteConsoleRegistry:
             record = self._machines.get(session.attached_machine_id)
             if record is None:
                 raise LookupError("attached machine not found")
+            if record.owner_username is not None and record.owner_username != session.username:
+                raise PermissionError("machine belongs to another user")
             if not self._machine_connected_locked(record):
                 raise ConnectionError("attached machine is offline")
             if require_instance is not None and not machine_has_instance(
@@ -241,12 +278,16 @@ class RemoteConsoleRegistry:
 
     def _build_session_snapshot_locked(self, token: str) -> dict[str, object]:
         session = self._sessions.get(token)
+        if session is None:
+            raise PermissionError("authentication required")
         attached_machine_payload = None
         instances: list[dict[str, object]] = []
         can_create_instances = False
-        if session is not None and session.attached_machine_id is not None:
+        if session.attached_machine_id is not None:
             record = self._machines.get(session.attached_machine_id)
-            if record is not None:
+            if record is not None and (
+                record.owner_username is None or record.owner_username == session.username
+            ):
                 connected = self._machine_connected_locked(record)
                 attached_machine_payload = {
                     "machine_id": record.machine_id,
@@ -261,6 +302,7 @@ class RemoteConsoleRegistry:
                 can_create_instances = connected
         return {
             "listen_url": self.listen_url,
+            "viewer_username": session.username,
             "attached_machine": attached_machine_payload,
             "instances": instances,
             "can_create_instances": can_create_instances,
@@ -323,6 +365,12 @@ class RemoteConsoleRegistry:
                 return True
             except queue.Full:
                 return False
+
+    def _claim_machine_locked(self, machine_key: str, username: str) -> None:
+        next_machine_owners = dict(self._machine_owners)
+        next_machine_owners[machine_key] = username
+        persist_state_file(self._state_path, next_machine_owners)
+        self._machine_owners = next_machine_owners
 
 
 class RemoteConsoleHTTPServer(ThreadingHTTPServer):
@@ -449,14 +497,18 @@ class RemoteConsoleRequestHandler(BaseHTTPRequestHandler):
         if not isinstance(payload, dict):
             self.send_json(400, {"error": "request body must be a JSON object"})
             return
+        username = coerce_text(payload.get("username"))
         password = coerce_text(payload.get("password"))
+        if username is None:
+            self.send_json(400, {"error": '"username" must be a non-empty string'})
+            return
         if password is None:
             self.send_json(400, {"error": '"password" must be a non-empty string'})
             return
-        if not self.server.registry.verify_password(password):
-            self.send_json(401, {"error": "invalid password"})
+        if not self.server.registry.verify_login(username, password):
+            self.send_json(401, {"error": "invalid username or password"})
             return
-        token = self.server.registry.create_session()
+        token = self.server.registry.create_session(username)
         response = {"ok": True, "snapshot": self.server.registry.session_snapshot(token)}
         payload_bytes = encode_json(response)
         self.send_response(200)
@@ -507,7 +559,11 @@ class RemoteConsoleRequestHandler(BaseHTTPRequestHandler):
             self.send_json(404, {"error": str(error)})
             return
         except PermissionError as error:
-            self.send_json(401, {"error": str(error)})
+            status_code = 403 if str(error) == "machine belongs to another user" else 401
+            self.send_json(status_code, {"error": str(error)})
+            return
+        except RuntimeError as error:
+            self.send_json(500, {"error": str(error)})
             return
         self.send_json(200, {"ok": True, "snapshot": snapshot})
 
@@ -781,6 +837,146 @@ def encode_json(payload: object) -> bytes:
     return json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
 
 
+def encode_json_pretty(payload: object) -> str:
+    return json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True) + "\n"
+
+
+def load_users_file(path: Path) -> dict[str, str]:
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError as error:
+        raise RuntimeError(f"users file not found: {path}") from error
+    except (OSError, json.JSONDecodeError) as error:
+        raise RuntimeError(f"failed to load users file {path}: {error}") from error
+
+    if not isinstance(payload, dict):
+        raise RuntimeError("users file must contain a JSON object")
+    users = payload.get("users")
+    if not isinstance(users, list) or not users:
+        raise RuntimeError('users file must contain a non-empty "users" array')
+
+    user_map: dict[str, str] = {}
+    for entry in users:
+        if not isinstance(entry, dict):
+            raise RuntimeError("each user entry must be a JSON object")
+        username = coerce_text(entry.get("username"))
+        password_hash = coerce_text(entry.get("password_hash"))
+        if username is None:
+            raise RuntimeError('each user entry must include a non-empty "username"')
+        if password_hash is None:
+            raise RuntimeError(
+                f'user "{username}" must include a non-empty "password_hash"'
+            )
+        validate_password_hash(password_hash)
+        if username in user_map:
+            raise RuntimeError(f'duplicate username in users file: "{username}"')
+        user_map[username] = password_hash
+    return user_map
+
+
+def load_state_file(path: Path, users: dict[str, str]) -> dict[str, str]:
+    if not path.exists():
+        return {}
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as error:
+        raise RuntimeError(f"failed to load state file {path}: {error}") from error
+
+    if not isinstance(payload, dict):
+        raise RuntimeError("state file must contain a JSON object")
+
+    machine_owners = payload.get("machine_owners", {})
+    if not isinstance(machine_owners, dict):
+        raise RuntimeError('state file field "machine_owners" must be a JSON object')
+
+    normalized: dict[str, str] = {}
+    for machine_key, owner_username in machine_owners.items():
+        if not isinstance(machine_key, str) or not machine_key.strip():
+            raise RuntimeError("state file contains an invalid machine key")
+        if not isinstance(owner_username, str) or not owner_username.strip():
+            raise RuntimeError("state file contains an invalid machine owner")
+        normalized_owner = owner_username.strip()
+        if normalized_owner not in users:
+            raise RuntimeError(
+                f'state file references unknown user "{normalized_owner}" for a machine owner'
+            )
+        normalized[machine_key.strip()] = normalized_owner
+    return normalized
+
+
+def persist_state_file(path: Path, machine_owners: dict[str, str]) -> None:
+    payload = {"machine_owners": dict(sorted(machine_owners.items()))}
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temp_path: Optional[Path] = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            "w",
+            encoding="utf-8",
+            dir=path.parent,
+            prefix=f".{path.name}.",
+            suffix=".tmp",
+            delete=False,
+        ) as handle:
+            temp_path = Path(handle.name)
+            handle.write(encode_json_pretty(payload))
+            handle.flush()
+            os.fsync(handle.fileno())
+        temp_path.replace(path)
+    except OSError as error:
+        raise RuntimeError(f"failed to persist state file {path}: {error}") from error
+    finally:
+        if temp_path is not None:
+            try:
+                temp_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+
+
+def validate_password_hash(value: str) -> None:
+    parse_password_hash(value)
+
+
+def parse_password_hash(value: str) -> tuple[int, bytes, bytes]:
+    parts = value.split("$")
+    if len(parts) != 4 or parts[0] != PASSWORD_HASH_PREFIX:
+        raise RuntimeError(
+            f'password hash must use format "{PASSWORD_HASH_PREFIX}$<iterations>$<salt>$<digest>"'
+        )
+    try:
+        iterations = int(parts[1])
+    except ValueError as error:
+        raise RuntimeError("password hash iterations must be an integer") from error
+    if iterations <= 0:
+        raise RuntimeError("password hash iterations must be positive")
+    salt = decode_base64_field(parts[2], "password hash salt")
+    digest = decode_base64_field(parts[3], "password hash digest")
+    if not salt:
+        raise RuntimeError("password hash salt must not be empty")
+    if not digest:
+        raise RuntimeError("password hash digest must not be empty")
+    return iterations, salt, digest
+
+
+def decode_base64_field(value: str, label: str) -> bytes:
+    padding = "=" * ((4 - (len(value) % 4)) % 4)
+    try:
+        return base64.urlsafe_b64decode(value + padding)
+    except (ValueError, TypeError) as error:
+        raise RuntimeError(f"{label} is not valid base64") from error
+
+
+def verify_password_hash(password: str, stored_hash: str) -> bool:
+    iterations, salt, expected = parse_password_hash(stored_hash)
+    actual = hashlib.pbkdf2_hmac(
+        PASSWORD_HASH_DIGEST,
+        password.encode("utf-8"),
+        salt,
+        iterations,
+        dklen=len(expected),
+    )
+    return secrets.compare_digest(actual, expected)
+
+
 def parse_positive_int(value: str) -> int:
     parsed = int(value)
     if parsed <= 0:
@@ -792,13 +988,17 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--bind", required=True)
     parser.add_argument("--port", type=parse_positive_int, required=True)
-    parser.add_argument("--password", required=True)
+    parser.add_argument("--users-file", required=True)
+    parser.add_argument("--state-file", required=True)
     return parser.parse_args()
 
 
 def main() -> int:
     args = parse_args()
-    registry = RemoteConsoleRegistry(args.bind, args.port, args.password)
+    users = load_users_file(Path(args.users_file))
+    state_path = Path(args.state_file)
+    machine_owners = load_state_file(state_path, users)
+    registry = RemoteConsoleRegistry(args.bind, args.port, users, state_path, machine_owners)
     server = RemoteConsoleHTTPServer(
         (args.bind, args.port),
         RemoteConsoleRequestHandler,
