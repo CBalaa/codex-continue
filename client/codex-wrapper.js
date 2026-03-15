@@ -1,22 +1,25 @@
 #!/usr/bin/env node
 
-import { spawn, spawnSync } from "node:child_process";
-import { existsSync, readFileSync } from "node:fs";
+import { spawn } from "node:child_process";
+import {
+  accessSync,
+  constants,
+  existsSync,
+  readFileSync,
+  realpathSync,
+} from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import process from "node:process";
 import { fileURLToPath } from "node:url";
 
 const __filename = fileURLToPath(import.meta.url);
-const __dirname = path.dirname(__filename);
 
-const REAL_LAUNCHER = path.join(__dirname, "codex.real.js");
-const PTY_HELPER = path.join(__dirname, "codex-auto-continue-pty.py");
-const WEB_SERVER = path.join(__dirname, "codex-auto-continue-web-server.py");
 const WRAPPER_AUTO_FLAG = "--auto-mode";
 const WRAPPER_CHAT_FLAG = "--chat-mode";
 const WRAPPER_NATIVE_FLAG = "--native";
 const WRAPPER_WEB_CONSOLE_FLAG = "--web-console";
+const WRAPPER_WEB_AGENT_FLAG = "--web-console-agent";
 const REMOVED_WRAPPER_AUTO_FLAG = "--auto-continue";
 const REMOVED_WRAPPER_NO_AUTO_FLAG = "--no-auto-continue";
 const WRAPPER_PROMPT_FLAG = "--auto-continue-prompt";
@@ -36,8 +39,21 @@ const COMMENT_WEB_PASSWORD_KEYS = [
   "codex-remote-web-password",
   "codex-auto-continue-web-password",
 ];
+const COMMENT_REMOTE_SERVER_URL_KEYS = [
+  "codex-remote-server-url",
+  "codex-auto-continue-server-url",
+];
+const COMMENT_REMOTE_MACHINE_NAME_KEYS = [
+  "codex-remote-machine-name",
+  "codex-auto-continue-machine-name",
+];
+const COMMENT_LAUNCH_SCRIPT_KEYS = [
+  "codex-remote-launch-script",
+  "codex-auto-continue-launch-script",
+];
 const DEFAULT_WEB_BIND = "127.0.0.1";
 const DEFAULT_WEB_PORT = 8765;
+const DEFAULT_MACHINE_KEY_FILENAME = "codex-auto-continue-machine-key.txt";
 const DEBUG_LOG_PATH =
   process.env.CODEX_AUTO_CONTINUE_DEBUG_LOG ||
   path.join(os.tmpdir(), "codex-auto-continue-debug.log");
@@ -203,27 +219,55 @@ function parseCommentIntegerSetting(configPath, setting) {
   }
 }
 
-function resolveWebSettings(parsed) {
+function resolveRemoteSettings(parsed) {
   const configPath = resolveCodexConfigPath(parsed.passthrough);
+  const configDir = path.dirname(configPath);
   if (!existsSync(configPath)) {
     return {
       configExists: false,
       configPath,
+      configDir,
+      launchScript: null,
       webBind: null,
       webPort: null,
       webPassword: null,
+      remoteServerUrl: null,
+      machineName: null,
+      machineKeyFile: path.join(configDir, DEFAULT_MACHINE_KEY_FILENAME),
     };
   }
 
   const fileText = readFileSync(configPath, "utf8");
   const passwordSetting = findConfigSetting(fileText, COMMENT_WEB_PASSWORD_KEYS);
+  const serverUrlSetting = findConfigSetting(fileText, COMMENT_REMOTE_SERVER_URL_KEYS);
+  const machineNameSetting = findConfigSetting(fileText, COMMENT_REMOTE_MACHINE_NAME_KEYS);
+  const launchScriptSetting = findConfigSetting(fileText, COMMENT_LAUNCH_SCRIPT_KEYS);
+
+  const launchScript =
+    launchScriptSetting === null
+      ? null
+      : path.resolve(
+          expandHomePath(parseCommentStringSetting(configPath, launchScriptSetting)),
+        );
+
   if (passwordSetting === null) {
     return {
       configExists: true,
       configPath,
+      configDir,
+      launchScript,
       webBind: null,
       webPort: null,
       webPassword: null,
+      remoteServerUrl:
+        serverUrlSetting === null
+          ? null
+          : parseCommentStringSetting(configPath, serverUrlSetting),
+      machineName:
+        machineNameSetting === null
+          ? null
+          : parseCommentStringSetting(configPath, machineNameSetting),
+      machineKeyFile: path.join(configDir, DEFAULT_MACHINE_KEY_FILENAME),
     };
   }
 
@@ -233,6 +277,8 @@ function resolveWebSettings(parsed) {
   return {
     configExists: true,
     configPath,
+    configDir,
+    launchScript,
     webBind:
       bindSetting === null
         ? DEFAULT_WEB_BIND
@@ -242,13 +288,21 @@ function resolveWebSettings(parsed) {
         ? DEFAULT_WEB_PORT
         : parseCommentIntegerSetting(configPath, portSetting),
     webPassword: parseCommentStringSetting(configPath, passwordSetting),
+    remoteServerUrl:
+      serverUrlSetting === null
+        ? null
+        : parseCommentStringSetting(configPath, serverUrlSetting),
+    machineName:
+      machineNameSetting === null
+        ? null
+        : parseCommentStringSetting(configPath, machineNameSetting),
+    machineKeyFile: path.join(configDir, DEFAULT_MACHINE_KEY_FILENAME),
   };
 }
 
 function parseWrapperArgs(argv) {
   const passthrough = [];
   let launchMode = null;
-  let launchConsole = false;
   let autoPrompt = "继续";
   let autoLimit = null;
 
@@ -262,12 +316,10 @@ function parseWrapperArgs(argv) {
   for (let index = 0; index < argv.length; index += 1) {
     const arg = argv[index];
 
-    if (arg === WRAPPER_WEB_CONSOLE_FLAG) {
-      if (launchConsole || launchMode !== null) {
-        throw new Error(`${WRAPPER_WEB_CONSOLE_FLAG} cannot be combined with another launch mode flag.`);
-      }
-      launchConsole = true;
-      continue;
+    if (arg === WRAPPER_WEB_CONSOLE_FLAG || arg === WRAPPER_WEB_AGENT_FLAG) {
+      throw new Error(
+        `${arg} is no longer available through \`codex\`; run the configured launch script directly instead.`,
+      );
     }
 
     if (arg === WRAPPER_AUTO_FLAG) {
@@ -332,7 +384,6 @@ function parseWrapperArgs(argv) {
 
   return {
     launchMode,
-    launchConsole,
     autoLimit,
     autoPrompt,
     passthrough,
@@ -359,26 +410,6 @@ function shouldOfferAutoContinue(argv) {
   return !NON_INTERACTIVE_SUBCOMMANDS.has(firstArg);
 }
 
-function findPython() {
-  const candidates = [];
-  if (process.env.PYTHON) {
-    candidates.push([process.env.PYTHON]);
-  }
-  candidates.push(["python3"], ["python"]);
-
-  for (const candidate of candidates) {
-    const [command, ...prefixArgs] = candidate;
-    const result = spawnSync(command, [...prefixArgs, "--version"], {
-      stdio: "ignore",
-    });
-    if (!result.error && result.status === 0) {
-      return candidate;
-    }
-  }
-
-  return null;
-}
-
 function formatModeName(mode) {
   if (mode === "auto") {
     return "auto mode";
@@ -395,6 +426,60 @@ function formatWebUrl(bind, port) {
   }
   const host = bind.includes(":") && !bind.startsWith("[") ? `[${bind}]` : bind;
   return `http://${host}:${port}/`;
+}
+
+function isExecutableFile(candidate) {
+  try {
+    accessSync(candidate, constants.X_OK);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function resolveNativeCodexCommand() {
+  const wrapperRealPath = realpathSync(__filename);
+  const pathEntries = (process.env.PATH || "")
+    .split(path.delimiter)
+    .map((value) => value.trim())
+    .filter((value) => value.length > 0);
+
+  for (const entry of pathEntries) {
+    const candidate = path.join(entry, "codex");
+    if (!isExecutableFile(candidate)) {
+      continue;
+    }
+
+    let candidateRealPath;
+    try {
+      candidateRealPath = realpathSync(candidate);
+    } catch {
+      continue;
+    }
+
+    if (candidateRealPath === wrapperRealPath) {
+      continue;
+    }
+
+    return candidate;
+  }
+
+  throw new Error(
+    "could not find native codex on PATH after this wrapper; ensure the native Codex binary is still installed later in PATH.",
+  );
+}
+
+function launchScriptProblem(remoteSettings) {
+  if (remoteSettings.configExists === false) {
+    return `${remoteSettings.configPath} was not found`;
+  }
+  if (remoteSettings.launchScript === null) {
+    return `no launch script is configured in ${remoteSettings.configPath}`;
+  }
+  if (!existsSync(remoteSettings.launchScript)) {
+    return `launch script ${remoteSettings.launchScript} was not found`;
+  }
+  return null;
 }
 
 async function spawnAndMirror(command, args, options = {}) {
@@ -423,11 +508,6 @@ async function spawnAndMirror(command, args, options = {}) {
 }
 
 async function main() {
-  if (!existsSync(REAL_LAUNCHER)) {
-    console.error(`Missing backup launcher: ${REAL_LAUNCHER}`);
-    process.exit(1);
-  }
-
   let parsed;
   try {
     parsed = parseWrapperArgs(process.argv.slice(2));
@@ -436,77 +516,23 @@ async function main() {
     process.exit(1);
   }
 
-  if (parsed.launchConsole) {
-    let webSettings;
-    try {
-      webSettings = resolveWebSettings(parsed);
-    } catch (error) {
-      console.error(`[codex-auto-continue] ${error.message}`);
-      process.exit(1);
-    }
-
-    if (webSettings.webPassword === null) {
-      const detail =
-        webSettings.configExists === false
-          ? `${webSettings.configPath} was not found`
-          : `no web password is configured in ${webSettings.configPath}`;
-      console.error(
-        `[codex-auto-continue] ${detail}; add "# codex-remote-web-password = \\\"change-me\\\"" to enable the private web console.`,
-      );
-      process.exit(1);
-    }
-
-    if (!existsSync(WEB_SERVER)) {
-      console.error(`[codex-auto-continue] missing manager ${WEB_SERVER}.`);
-      process.exit(1);
-    }
-
-    const python = findPython();
-    if (!python) {
-      console.error(
-        "[codex-auto-continue] web console mode requires python3, python, or PYTHON on PATH.",
-      );
-      process.exit(1);
-    }
-
-    console.error(
-      `[codex-auto-continue] starting private web console at ${JSON.stringify(
-        formatWebUrl(webSettings.webBind, webSettings.webPort),
-      )} from ${webSettings.configPath}.`,
-    );
-    console.error(
-      '[codex-auto-continue] open the web console and use "新建标签页" to start background Codex sessions.',
-    );
-
-    const [pythonCommand, ...pythonArgs] = python;
-    await spawnAndMirror(pythonCommand, [
-      ...pythonArgs,
-      WEB_SERVER,
-      "--bind",
-      webSettings.webBind,
-      "--port",
-      String(webSettings.webPort),
-      "--password",
-      webSettings.webPassword,
-      "--node",
-      process.execPath,
-      "--launcher",
-      REAL_LAUNCHER,
-      "--",
-      ...parsed.passthrough,
-    ]);
-    return;
+  let nativeCodex;
+  try {
+    nativeCodex = resolveNativeCodexCommand();
+  } catch (error) {
+    console.error(`[codex-auto-continue] ${error.message}`);
+    process.exit(1);
   }
 
   const eligibleForAutoContinue = shouldOfferAutoContinue(parsed.passthrough);
   if (!eligibleForAutoContinue) {
-    await spawnAndMirror(process.execPath, [REAL_LAUNCHER, ...parsed.passthrough]);
+    await spawnAndMirror(nativeCodex, parsed.passthrough);
     return;
   }
 
   const launchMode = parsed.launchMode ?? "chat";
   if (launchMode === "native") {
-    await spawnAndMirror(process.execPath, [REAL_LAUNCHER, ...parsed.passthrough]);
+    await spawnAndMirror(nativeCodex, parsed.passthrough);
     return;
   }
 
@@ -514,48 +540,41 @@ async function main() {
     console.error(
       `[codex-auto-continue] ${formatModeName(launchMode)} requires an interactive TTY; starting native Codex.`,
     );
-    await spawnAndMirror(process.execPath, [REAL_LAUNCHER, ...parsed.passthrough]);
+    await spawnAndMirror(nativeCodex, parsed.passthrough);
     return;
   }
 
-  if (!existsSync(PTY_HELPER)) {
-    console.error(
-      `[codex-auto-continue] missing helper ${PTY_HELPER}; starting native Codex.`,
-    );
-    await spawnAndMirror(process.execPath, [REAL_LAUNCHER, ...parsed.passthrough]);
-    return;
-  }
-
-  let webSettings;
+  let remoteSettings;
   try {
-    webSettings = resolveWebSettings(parsed);
+    remoteSettings = resolveRemoteSettings(parsed);
   } catch (error) {
     console.error(
       `[codex-auto-continue] ${error.message} Starting native Codex instead.`,
     );
-    await spawnAndMirror(process.execPath, [REAL_LAUNCHER, ...parsed.passthrough]);
+    await spawnAndMirror(nativeCodex, parsed.passthrough);
     return;
   }
 
-  if (webSettings.webPassword === null) {
+  if (remoteSettings.webPassword === null) {
     const detail =
-      webSettings.configExists === false
-        ? `${webSettings.configPath} was not found`
-        : `no web password is configured in ${webSettings.configPath}`;
+      remoteSettings.configExists === false
+        ? `${remoteSettings.configPath} was not found`
+        : `no web password is configured in ${remoteSettings.configPath}`;
     console.error(
       `[codex-auto-continue] ${formatModeName(launchMode)} requested, but ${detail}; starting native Codex. Add ` +
         `"# codex-remote-web-password = \\\"change-me\\\"" to enable the private web console.`,
     );
-    await spawnAndMirror(process.execPath, [REAL_LAUNCHER, ...parsed.passthrough]);
+    await spawnAndMirror(nativeCodex, parsed.passthrough);
     return;
   }
 
-  const python = findPython();
-  if (!python) {
+  const launchScriptIssue = launchScriptProblem(remoteSettings);
+  if (launchScriptIssue !== null) {
     console.error(
-      `[codex-auto-continue] ${formatModeName(launchMode)} requires python3, python, or PYTHON on PATH; starting native Codex.`,
+      `[codex-auto-continue] ${formatModeName(launchMode)} requested, but ${launchScriptIssue}; starting native Codex. Add ` +
+        `"# codex-remote-launch-script = \\\"/absolute/path/to/client/codex-auto-continue-launch\\\"" to enable the web console bridge.`,
     );
-    await spawnAndMirror(process.execPath, [REAL_LAUNCHER, ...parsed.passthrough]);
+    await spawnAndMirror(nativeCodex, parsed.passthrough);
     return;
   }
 
@@ -579,32 +598,26 @@ async function main() {
 
   console.error(
     `[codex-auto-continue] private web console on ${JSON.stringify(
-      formatWebUrl(webSettings.webBind, webSettings.webPort),
-    )} from ${webSettings.configPath}.`,
+      formatWebUrl(remoteSettings.webBind, remoteSettings.webPort),
+    )} from ${remoteSettings.configPath}.`,
   );
   console.error(
     "[codex-auto-continue] this session will appear as a tab automatically after the web console connects.",
   );
 
-  const [pythonCommand, ...pythonArgs] = python;
-  await spawnAndMirror(pythonCommand, [
-    ...pythonArgs,
-    PTY_HELPER,
-    "--node",
-    process.execPath,
-    "--launcher",
-    REAL_LAUNCHER,
+  await spawnAndMirror(remoteSettings.launchScript, [
+    "codex",
     "--mode",
     launchMode,
     "--prompt",
     parsed.autoPrompt,
     ...(parsed.autoLimit === null ? [] : ["--limit", String(parsed.autoLimit)]),
     "--web-bind",
-    webSettings.webBind,
+    remoteSettings.webBind,
     "--web-port",
-    String(webSettings.webPort),
+    String(remoteSettings.webPort),
     "--web-password",
-    webSettings.webPassword,
+    remoteSettings.webPassword,
     "--",
     ...parsed.passthrough,
   ]);

@@ -8,7 +8,6 @@ import json
 import queue
 import secrets
 import subprocess
-import sys
 import tempfile
 import threading
 import time
@@ -59,20 +58,16 @@ class ConsoleRegistry:
         bind: str,
         port: int,
         password: str,
-        node: Optional[str],
-        launcher: Optional[str],
+        launch_script: Optional[str],
         child_passthrough: list[str],
     ):
         self.bind = bind
         self.port = port
         self.password = password
-        self.node = node
-        self.launcher = launcher
+        self.launch_script = launch_script
         self.child_passthrough = list(child_passthrough)
         self.listen_url = build_listen_url(bind, port)
         self.static_dir = Path(__file__).resolve().parent
-        self.helper_path = self.static_dir / "codex-auto-continue-pty.py"
-        self.python_argv = current_python_argv()
         self._lock = threading.Lock()
         self._sessions: dict[str, SessionRecord] = {}
         self._instances: dict[str, InstanceRecord] = {}
@@ -129,9 +124,9 @@ class ConsoleRegistry:
             return self._build_session_snapshot_locked()
 
     def create_instance(self) -> tuple[str, dict[str, object]]:
-        if self.node is None or self.launcher is None:
+        if self.launch_script is None:
             raise RuntimeError(
-                "instance creation is unavailable because the manager was started without launcher settings"
+                "instance creation is unavailable because the manager was started without a launch script"
             )
 
         with self._lock:
@@ -274,22 +269,16 @@ class ConsoleRegistry:
         return command
 
     def _spawn_instance(self, record: InstanceRecord) -> None:
-        if self.node is None or self.launcher is None:
-            raise RuntimeError("missing launcher settings")
-        if not self.helper_path.exists():
-            raise RuntimeError(f"missing helper: {self.helper_path}")
+        if self.launch_script is None:
+            raise RuntimeError("missing launch script")
 
         log_path = Path(tempfile.gettempdir()) / (
             f"codex-auto-continue-{record.instance_id}.log"
         )
         log_handle = open(log_path, "ab")
         argv = [
-            *self.python_argv,
-            str(self.helper_path),
-            "--node",
-            self.node,
-            "--launcher",
-            self.launcher,
+            self.launch_script,
+            "codex",
             "--mode",
             "chat",
             "--prompt",
@@ -408,7 +397,7 @@ class ConsoleRegistry:
         ]
         return {
             "listen_url": self.listen_url,
-            "can_create_instances": self.node is not None and self.launcher is not None,
+            "can_create_instances": self.launch_script is not None,
             "instances": instances,
         }
 
@@ -900,12 +889,6 @@ def parse_positive_int(value: str) -> int:
     return parsed
 
 
-def current_python_argv() -> list[str]:
-    if sys.executable:
-        return [sys.executable]
-    return ["python3"]
-
-
 def default_instance_snapshot() -> dict[str, object]:
     return {
         "mode": "chat",
@@ -949,8 +932,7 @@ def parse_args() -> tuple[argparse.Namespace, list[str]]:
     parser.add_argument("--bind", required=True)
     parser.add_argument("--port", type=parse_positive_int, required=True)
     parser.add_argument("--password", required=True)
-    parser.add_argument("--node")
-    parser.add_argument("--launcher")
+    parser.add_argument("--launch-script")
     parser.add_argument("passthrough", nargs=argparse.REMAINDER)
     args = parser.parse_args()
 
@@ -967,8 +949,7 @@ def main() -> int:
         args.bind,
         args.port,
         args.password,
-        args.node,
-        args.launcher,
+        args.launch_script,
         passthrough,
     )
     server = RemoteConsoleHTTPServer(

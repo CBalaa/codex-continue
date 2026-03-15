@@ -1,0 +1,123 @@
+#!/usr/bin/env python3
+
+from __future__ import annotations
+
+import argparse
+import os
+import sys
+from pathlib import Path
+
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+CLIENT_DIR = PROJECT_ROOT / "client"
+SERVER_DIR = PROJECT_ROOT / "server"
+
+
+def current_python_argv() -> list[str]:
+    if sys.executable:
+        return [sys.executable]
+    return ["python3"]
+
+
+def exec_python_script(script_name: str, args: list[str]) -> int:
+    script_path = resolve_script_path(script_name)
+    argv = [*current_python_argv(), str(script_path), *args]
+    os.execvpe(argv[0], argv, os.environ.copy())
+    return 1
+
+
+def resolve_script_path(script_name: str) -> Path:
+    if script_name == "codex-auto-continue-remote-server.py":
+        return SERVER_DIR / script_name
+    return CLIENT_DIR / script_name
+
+
+def parse_args() -> tuple[argparse.Namespace, list[str]]:
+    parser = argparse.ArgumentParser()
+    subparsers = parser.add_subparsers(dest="command", required=True)
+
+    server_parser = subparsers.add_parser("server")
+    server_parser.add_argument("--bind", required=True)
+    server_parser.add_argument("--port", required=True)
+    server_parser.add_argument("--password", required=True)
+
+    agent_parser = subparsers.add_parser("agent")
+    agent_parser.add_argument("--server-url", required=True)
+    agent_parser.add_argument("--machine-key-file", required=True)
+    agent_parser.add_argument("--machine-name")
+    agent_parser.add_argument("passthrough", nargs=argparse.REMAINDER)
+
+    codex_parser = subparsers.add_parser("codex")
+    codex_parser.add_argument("--mode", choices=["auto", "chat"], required=True)
+    codex_parser.add_argument("--prompt", required=True)
+    codex_parser.add_argument("--limit")
+    codex_parser.add_argument("--web-bind", required=True)
+    codex_parser.add_argument("--web-port", required=True)
+    codex_parser.add_argument("--web-password", required=True)
+    codex_parser.add_argument("--instance-id")
+    codex_parser.add_argument("passthrough", nargs=argparse.REMAINDER)
+
+    args = parser.parse_args()
+    passthrough = list(getattr(args, "passthrough", []))
+    if passthrough and passthrough[0] == "--":
+        passthrough = passthrough[1:]
+    return args, passthrough
+
+
+def main() -> int:
+    args, passthrough = parse_args()
+    self_path = str(Path(__file__).resolve())
+
+    if args.command == "server":
+        exec_python_script(
+            "codex-auto-continue-remote-server.py",
+            [
+                "--bind",
+                args.bind,
+                "--port",
+                args.port,
+                "--password",
+                args.password,
+            ],
+        )
+
+    if args.command == "agent":
+        argv = [
+            "--server-url",
+            args.server_url,
+            "--machine-key-file",
+            args.machine_key_file,
+            "--launch-script",
+            self_path,
+        ]
+        if args.machine_name:
+            argv.extend(["--machine-name", args.machine_name])
+        argv.extend(["--", *passthrough])
+        exec_python_script("codex-auto-continue-agent.py", argv)
+
+    if args.command == "codex":
+        argv = [
+            "--launch-script",
+            self_path,
+            "--mode",
+            args.mode,
+            "--prompt",
+            args.prompt,
+            "--web-bind",
+            args.web_bind,
+            "--web-port",
+            args.web_port,
+            "--web-password",
+            args.web_password,
+        ]
+        if args.limit:
+            argv.extend(["--limit", args.limit])
+        if args.instance_id:
+            argv.extend(["--instance-id", args.instance_id])
+        argv.extend(["--", *passthrough])
+        exec_python_script("codex-auto-continue-pty.py", argv)
+
+    raise AssertionError(f"unsupported command: {args.command}")
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

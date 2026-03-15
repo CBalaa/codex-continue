@@ -1,0 +1,8 @@
+{
+  "name": "codex-continue",
+  "private": true,
+  "scripts": {
+    "server": "./server/start",
+    "client": "./client/start"
+  }
+}

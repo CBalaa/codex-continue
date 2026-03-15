@@ -17,6 +17,7 @@
         </div>
         <div class="hero-actions">
           <span class="listen-url" id="listenUrl">--</span>
+          <span class="binding-hint" id="machineBadge" hidden>未连接机器</span>
           <span class="binding-hint" id="activeTabBadge" hidden>未选择标签页</span>
           <button id="logoutButton" class="ghost" type="button" hidden>退出登录</button>
         </div>
@@ -25,7 +26,7 @@
       <section class="panel auth-panel" id="authPanel">
         <div class="panel-head">
           <h2>登录</h2>
-          <p>先用控制台密码登录。登录后可以直接新建和管理多个 Codex 标签页。</p>
+          <p>先用控制台密码登录。登录后输入机器 key 绑定在线 agent，再创建和管理多个 Codex 标签页。</p>
         </div>
         <form id="loginForm" class="stack-form">
           <label>
@@ -38,11 +39,50 @@
       </section>
 
       <section class="console" id="consolePanel" hidden>
+        <article class="panel machine-panel" id="machinePanel">
+          <div class="panel-head compact">
+            <div>
+              <h2>目标机器</h2>
+              <p class="minor" id="machinePanelHint">输入本地 agent 启动时打印出来的机器 key。</p>
+            </div>
+            <span class="minor" id="machineStateText">未连接</span>
+          </div>
+
+          <form id="machineConnectForm" class="machine-connect-form">
+            <label class="attach-input">
+              <span>机器 key</span>
+              <input id="machineKeyInput" type="password" autocomplete="off" placeholder="输入正确的机器 key 后连接">
+            </label>
+            <button id="machineConnectButton" type="submit">连接机器</button>
+            <button id="machineDisconnectButton" type="button" class="ghost" hidden>断开机器</button>
+          </form>
+
+          <div class="machine-summary">
+            <div class="machine-summary-card">
+              <span class="minor">当前机器</span>
+              <strong id="machineNameValue">未连接</strong>
+            </div>
+            <div class="machine-summary-card">
+              <span class="minor">连接状态</span>
+              <strong id="machineStatusValue">--</strong>
+            </div>
+            <div class="machine-summary-card">
+              <span class="minor">Key 提示</span>
+              <strong id="machineKeyHintValue">--</strong>
+            </div>
+            <div class="machine-summary-card">
+              <span class="minor">最后心跳</span>
+              <strong id="machineLastSeenValue">--</strong>
+            </div>
+          </div>
+          <p class="error" id="machineError"></p>
+        </article>
+
         <article class="panel tab-panel">
           <div class="panel-head compact">
             <div>
               <h2>Codex 标签页</h2>
-              <p class="minor">点击标签页切换实例；新建标签页会直接启动一个新的后台 Codex 会话。</p>
+              <p class="minor" id="tabPanelHint">绑定机器后，新建标签页会直接启动一个新的后台 Codex 会话。</p>
             </div>
             <span class="minor" id="streamState">实时连接中</span>
           </div>
@@ -57,7 +97,7 @@
 
         <section class="panel empty-console" id="emptyConsoleState">
           <h2>还没有选中的 Codex 标签页</h2>
-          <p>先在上面新建一个标签页，或等待已运行的实例自动出现在这里。</p>
+          <p id="emptyConsoleText">先连接机器并新建一个标签页，或等待已运行的实例同步到这里。</p>
         </section>
 
         <section id="instancePanels" hidden>

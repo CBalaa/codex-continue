@@ -121,6 +121,7 @@ textarea {
 }
 
 .auth-panel,
+.machine-panel,
 .tab-panel,
 .empty-console,
 .control-card,
@@ -163,6 +164,10 @@ textarea {
 }
 
 .tab-panel {
+  margin-bottom: 18px;
+}
+
+.machine-panel {
   margin-bottom: 18px;
 }
 
@@ -403,6 +408,32 @@ button.danger {
   align-items: end;
 }
 
+.machine-connect-form {
+  display: grid;
+  grid-template-columns: minmax(0, 1.4fr) auto auto;
+  gap: 12px;
+  align-items: end;
+  margin-bottom: 18px;
+}
+
+.machine-summary {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 12px;
+}
+
+.machine-summary-card {
+  display: grid;
+  gap: 6px;
+  padding: 12px 14px;
+  border-radius: 14px;
+  background: rgba(255, 255, 255, 0.52);
+}
+
+.machine-summary-card strong {
+  font-size: 16px;
+}
+
 .attach-input {
   margin: 0;
 }
@@ -524,6 +555,11 @@ button.danger {
   }
 
   .attach-form {
+    grid-template-columns: 1fr;
+  }
+
+  .machine-connect-form,
+  .machine-summary {
     grid-template-columns: 1fr;
   }
 }

@@ -65,6 +65,7 @@ STATIC_HTML = "codex-auto-continue-web.html"
 STATIC_CSS = "codex-auto-continue-web.css"
 STATIC_JS = "codex-auto-continue-web.js"
 SERVER_SCRIPT = "codex-auto-continue-web-server.py"
+NATIVE_CODEX_BINARY = "codex"
 
 
 @dataclass
@@ -112,8 +113,7 @@ class RemoteConsoleClient:
         bind: str,
         port: int,
         password: str,
-        node_bin: str,
-        launcher_path: str,
+        launch_script: str,
         child_passthrough: list[str],
         control_queue: queue.Queue,
         stop_event: threading.Event,
@@ -123,8 +123,7 @@ class RemoteConsoleClient:
         self.bind = bind
         self.port = port
         self.password = password
-        self.node_bin = node_bin
-        self.launcher_path = launcher_path
+        self.launch_script = launch_script
         self.child_passthrough = list(child_passthrough)
         self.control_queue = control_queue
         self.stop_event = stop_event
@@ -361,10 +360,8 @@ class RemoteConsoleClient:
             str(self.port),
             "--password",
             self.password,
-            "--node",
-            self.node_bin,
-            "--launcher",
-            self.launcher_path,
+            "--launch-script",
+            self.launch_script,
             "--",
             *self.child_passthrough,
         ]
@@ -1404,16 +1401,13 @@ def parse_positive_int(value: str) -> int:
 
 
 def build_child_argv(
-    node_bin: str,
-    launcher_path: str,
     passthrough: list[str],
     notifier_path: Path,
     host: str,
     port: int,
 ) -> list[str]:
     return [
-        node_bin,
-        launcher_path,
+        NATIVE_CODEX_BINARY,
         "--config",
         build_notify_override(current_python_argv(), notifier_path, host, port),
         *passthrough,
@@ -1446,8 +1440,7 @@ def start_remote_console_client(
     bind: str,
     port: int,
     password: str,
-    node_bin: str,
-    launcher_path: str,
+    launch_script: str,
     child_passthrough: list[str],
     control_queue: queue.Queue,
     stop_event: threading.Event,
@@ -1459,8 +1452,7 @@ def start_remote_console_client(
         bind,
         port,
         password,
-        node_bin,
-        launcher_path,
+        launch_script,
         child_passthrough,
         control_queue,
         stop_event,
@@ -1478,8 +1470,6 @@ def launch_child_unix(args: argparse.Namespace, passthrough: list[str]) -> int:
     child_env = os.environ.copy()
     parent_has_tty = os.isatty(sys.stdin.fileno()) and os.isatty(sys.stdout.fileno())
     child_argv = build_child_argv(
-        args.node,
-        args.launcher,
         passthrough,
         notifier_path,
         host,
@@ -1490,7 +1480,7 @@ def launch_child_unix(args: argparse.Namespace, passthrough: list[str]) -> int:
     if child_pid == 0:
         if not parent_has_tty:
             set_winsize_unix(0, DEFAULT_HEADLESS_ROWS, DEFAULT_HEADLESS_COLUMNS)
-        os.execvpe(args.node, child_argv, child_env)
+        os.execvpe(child_argv[0], child_argv, child_env)
 
     if not parent_has_tty:
         set_winsize_unix(master_fd, DEFAULT_HEADLESS_ROWS, DEFAULT_HEADLESS_COLUMNS)
@@ -1506,8 +1496,7 @@ def launch_child_unix(args: argparse.Namespace, passthrough: list[str]) -> int:
             args.web_bind,
             args.web_port,
             args.web_password,
-            args.node,
-            args.launcher,
+            args.launch_script,
             passthrough,
             args.instance_id,
         )
@@ -1529,8 +1518,7 @@ def forward_loop_unix(
     web_bind: str,
     web_port: int,
     web_password: str,
-    node_bin: str,
-    launcher_path: str,
+    launch_script: str,
     child_passthrough: list[str],
     instance_id: Optional[str],
 ) -> int:
@@ -1561,8 +1549,7 @@ def forward_loop_unix(
             web_bind,
             web_port,
             web_password,
-            node_bin,
-            launcher_path,
+            launch_script,
             child_passthrough,
             control_queue,
             stop_event,
@@ -1856,8 +1843,7 @@ def drain_queue_nowait(items: queue.Queue) -> list[object]:
 
 def parse_args() -> tuple[argparse.Namespace, list[str]]:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--node", required=True)
-    parser.add_argument("--launcher", required=True)
+    parser.add_argument("--launch-script", required=True)
     parser.add_argument("--mode", choices=[AUTO_MODE, CHAT_MODE], default=AUTO_MODE)
     parser.add_argument("--prompt", required=True)
     parser.add_argument("--limit", type=parse_positive_int)
