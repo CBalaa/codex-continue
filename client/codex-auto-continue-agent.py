@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import http.cookiejar
+import ipaddress
 import json
 import os
 import secrets
@@ -45,6 +46,16 @@ def normalize_server_url(value: str) -> str:
     parsed = urllib_parse.urlparse(value)
     if parsed.scheme not in {"http", "https"} or not parsed.netloc:
         raise argparse.ArgumentTypeError("server URL must be an absolute http(s) URL")
+    hostname = parsed.hostname
+    if hostname is None:
+        raise argparse.ArgumentTypeError("server URL must include a host")
+    if hostname.replace(".", "").isdigit():
+        try:
+            ipaddress.IPv4Address(hostname)
+        except ipaddress.AddressValueError as error:
+            raise argparse.ArgumentTypeError(
+                f"server URL host looks like an invalid IPv4 address: {hostname}"
+            ) from error
     normalized = parsed._replace(path=parsed.path.rstrip("/") or "", params="", query="", fragment="")
     return urllib_parse.urlunparse(normalized)
 
